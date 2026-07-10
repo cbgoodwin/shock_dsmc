@@ -7,6 +7,9 @@ Usage:
 
 plot_type : npt | rho | u | T | pdf | all
 output_folder : optional; defaults to the most recently modified shock_output_* folder
+
+In timeseries mode (detected automatically when per-period files are present),
+rho/u/T plots overlay all periods with a viridis colormap (early=dark, late=bright).
 """
 
 import sys
@@ -46,6 +49,35 @@ def load_dat(path):
     return np.loadtxt(path, skiprows=1)
 
 
+def is_timeseries(outdir):
+    """Return True if the folder contains timeseries (multi-period) output."""
+    return os.path.isfile(os.path.join(outdir, 'rho_1.dat'))
+
+
+def get_period_files(outdir, prefix):
+    """Return sorted list of per-period files matching <prefix>_N.dat."""
+    pattern = os.path.join(outdir, f'{prefix}_*.dat')
+    files = glob.glob(pattern)
+    # Sort by integer period number, not lexicographically
+    files.sort(key=lambda f: int(Path(f).stem.split('_')[-1]))
+    return files
+
+
+def get_gap(outdir):
+    """Return the -gap value used when producing this output folder (0 if not set)."""
+    run_info = os.path.join(outdir, 'run_info.txt')
+    if not os.path.isfile(run_info):
+        return 0
+    with open(run_info) as f:
+        cmd = f.readline().split()
+    for i, tok in enumerate(cmd):
+        if tok.startswith('-gap='):
+            return int(tok.split('=', 1)[1])
+        if tok == '-gap' and i + 1 < len(cmd):
+            return int(cmd[i + 1])
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # Individual plot functions
 # ---------------------------------------------------------------------------
@@ -57,6 +89,26 @@ def plot_npt(outdir):
 
     _, ax = plt.subplots(figsize=(7, 4))
     ax.plot(t, ratio, linewidth=1.2)
+
+    # In timeseries mode, draw separators at period boundaries
+    period_npt_files = get_period_files(outdir, 'npt')
+    if period_npt_files:
+        num_periods = len(period_npt_files)
+        period_steps = len(load_dat(period_npt_files[0]))
+        gap = get_gap(outdir)
+        stride = period_steps + gap
+        warmup_steps = len(t) - num_periods * period_steps - (num_periods - 1) * gap
+        for p in range(num_periods):
+            # Bar at the start of each period (also marks end of warmup / end of gap)
+            start_idx = warmup_steps + p * stride
+            if 0 <= start_idx < len(t):
+                ax.axvline(t[start_idx], color='gray', linewidth=0.7, linestyle='--', alpha=0.7)
+            # Bar at the end of each period where a gap follows
+            if gap > 0 and p < num_periods - 1:
+                end_idx = warmup_steps + p * stride + period_steps
+                if 0 <= end_idx < len(t):
+                    ax.axvline(t[end_idx], color='gray', linewidth=0.7, linestyle='--', alpha=0.7)
+
     ax.set_xlabel('Time')
     ax.set_ylabel(r'$N_p \/ / \/ N_0$')
     ax.set_title(f'Particle count in tube\n{Path(outdir).name}')
@@ -64,7 +116,37 @@ def plot_npt(outdir):
     plt.tight_layout()
 
 
+def _plot_spatial_timeseries(outdir, prefix, ylabel, title_label):
+    """Overlay all per-period spatial profiles with a viridis colormap."""
+    period_files = get_period_files(outdir, prefix)
+    if not period_files:
+        print(f'No {prefix}_N.dat files found in {Path(outdir).name}')
+        return
+
+    n = len(period_files)
+    colors = cm.viridis(np.linspace(0, 1, n))
+
+    _, ax = plt.subplots(figsize=(8, 5))
+
+    for fpath, color in zip(period_files, colors):
+        data = load_dat(fpath)
+        ax.plot(data[:, 0], data[:, 1], color=color, linewidth=1.0)
+
+    sm = plt.cm.ScalarMappable(cmap='viridis', norm=plt.Normalize(1, n))
+    sm.set_array([])
+    plt.colorbar(sm, ax=ax, label='period')
+
+    ax.set_xlabel(r'$x \/ / \/ \lambda_1$')
+    ax.set_ylabel(ylabel)
+    ax.set_title(f'{title_label} — timeseries ({n} periods)\n{Path(outdir).name}')
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+
+
 def plot_rho(outdir):
+    if is_timeseries(outdir):
+        _plot_spatial_timeseries(outdir, 'rho', r'$\rho \/ / \/ \rho_0$', 'Density profile')
+        return
     path = os.path.join(outdir, 'rho.dat')
     data = load_dat(path)
     x, rho = data[:, 0], data[:, 1]
@@ -79,6 +161,9 @@ def plot_rho(outdir):
 
 
 def plot_u(outdir):
+    if is_timeseries(outdir):
+        _plot_spatial_timeseries(outdir, 'u', r'$\langle u \rangle$', 'Mean x-velocity profile')
+        return
     path = os.path.join(outdir, 'u.dat')
     data = load_dat(path)
     x, u = data[:, 0], data[:, 1]
@@ -93,6 +178,9 @@ def plot_u(outdir):
 
 
 def plot_T(outdir):
+    if is_timeseries(outdir):
+        _plot_spatial_timeseries(outdir, 'T', 'T', 'Temperature profile')
+        return
     path = os.path.join(outdir, 'T.dat')
     data = load_dat(path)
     x, T = data[:, 0], data[:, 1]
@@ -195,12 +283,31 @@ def main():
     folder_arg = sys.argv[2] if len(sys.argv) >= 3 else None
     outdir = find_output_dir(folder_arg)
     print(f'Reading from: {Path(outdir).name}')
+    if is_timeseries(outdir):
+        n = len(get_period_files(outdir, 'rho'))
+        print(f'Timeseries mode detected: {n} period(s)')
+
+    # Derive plots folder from the datetime embedded in the output folder name
+    datetime_suffix = Path(outdir).name[len('shock_output_'):]
+    plots_dir = SCRIPT_DIR / f'plots_{datetime_suffix}'
+    plots_dir.mkdir(exist_ok=True)
 
     to_plot = list(PLOT_FUNCS.keys()) if plot_type == 'all' else [plot_type]
+    any_new = False
     for pt in to_plot:
+        plot_path = plots_dir / f'{pt}.pdf'
+        if plot_path.exists():
+            print(f'  {pt}.pdf already exists, skipping')
+            continue
+        figs_before = set(plt.get_fignums())
         PLOT_FUNCS[pt](outdir)
+        if set(plt.get_fignums()) - figs_before:
+            plt.savefig(plot_path, bbox_inches='tight')
+            print(f'  Saved {plot_path}')
+            any_new = True
 
-    plt.show()
+    if any_new:
+        plt.show()
 
 
 if __name__ == '__main__':
