@@ -4,8 +4,6 @@ Direct Simulation Monte Carlo (DSMC) shock simulation.
 Translated from shock_simulation_260317.f90
 """
 
-# add comment for testing
-
 import argparse
 import collections
 import math
