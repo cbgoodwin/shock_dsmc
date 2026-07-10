@@ -6,7 +6,10 @@ Translated from shock_simulation_260317.f90
 
 # add comment for testing
 
+import argparse
+import collections
 import math
+import sys
 import os
 from pathlib import Path
 from datetime import datetime
@@ -36,7 +39,7 @@ area = 1.0     # cross section area of tube
 RR = 1.0 / (2.0 * Tp1 * beta1**2)  # specific gas constant
 mm = Ru / RR                       # molar mass
 dm1 = math.sqrt(5.0 * mm * math.sqrt(RR * Tp1 / pi) / (16.0 * mu1))    # hard sphere diameter
-sigma_t = pi * dm1                                                     # collision cross section? 
+sigma_t = pi * dm1                                                     # collision cross section?
 cm1 = 2.0 / (math.sqrt(pi) * beta1)   # mean molecular speed
 lamda1 = cm1 * rho1 / mu1             # mean free path
 a1 = math.sqrt(gamma * RR * Tp1)      # speed of sound
@@ -66,9 +69,72 @@ Nmax = int(1.2 * N0)
 Nreal = ((rho1 + rho2) / mm) * AVOG * 60.0 * (lamda1 / 2.0) * area
 Wt = Nreal / N0      # scaling factor simulated # to real #?
 cell_stat = 92
-Nt_start = int(Nt * 0.8)
 Nt_end = Nt
-np_cell_max = int(float(Nmax) * float(Nt_end - Nt_start + 1) / float(ncell) * 5.0)
+
+
+class _Tee:
+    """Mirror stdout to a file, excluding per-step np= lines.
+
+    Buffers writes until a newline arrives so that the message and its
+    trailing newline are filtered together as a complete line.
+    """
+    def __init__(self, filepath):
+        self._file = open(filepath, 'w')
+        self._stdout = sys.stdout
+        self._buf = ''
+
+    def write(self, msg):
+        self._stdout.write(msg)
+        self._buf += msg
+        while '\n' in self._buf:
+            line, self._buf = self._buf.split('\n', 1)
+            if '  np= ' not in line:
+                self._file.write(line + '\n')
+
+    def flush(self):
+        self._stdout.flush()
+        self._file.flush()
+
+    def close(self):
+        if self._buf and '  np= ' not in self._buf:
+            self._file.write(self._buf)
+        sys.stdout = self._stdout
+        self._file.close()
+
+
+# ===== Argument Parsing =====
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='DSMC shock simulation')
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument('-s', action='store_true', help='Single batch mode')
+    mode.add_argument('-t', action='store_true', help='Timeseries mode')
+    parser.add_argument('-period', type=int, default=None,
+                        help='Number of time steps per sampling window (positive integer)')
+    parser.add_argument('-num_periods', type=int, default=None,
+                        help='Number of periods (required with -t)')
+    parser.add_argument('-initialize_empty', action='store_true',
+                        help='Start with an empty tube; particles enter only via inflow')
+    parser.add_argument('-gap', type=int, default=0,
+                        help='Steps between periods in timeseries mode (positive integer, -t only)')
+    args = parser.parse_args()
+
+    if args.t:
+        if args.period is None or args.num_periods is None:
+            parser.error('-t requires both -period and -num_periods')
+        if args.period <= 0:
+            parser.error('-period must be a positive integer')
+        if args.num_periods <= 0:
+            parser.error('-num_periods must be a positive integer')
+    if args.period is not None and args.period <= 0:
+        parser.error('-period must be a positive integer')
+    if args.gap != 0:
+        if args.s:
+            parser.error('-gap can only be used in timeseries mode (-t)')
+        if args.gap <= 0:
+            parser.error('-gap must be a positive integer')
+
+    return args
 
 
 # ===== Utility Functions =====
@@ -210,17 +276,40 @@ def collision(u, v, w, cell, cell_no, cr_max, vol_cell):
     w[pc] = wc
 
 
-def get_pdf_cell(ua, va, wa, np_cell, ipdf, outdir):
-    """Write velocity PDF for cell ipdf (0-based) and spatial profiles for all cells.
+def write_spatial_profiles(ua, va, wa, np_cell, outdir, n_sample_steps, suffix=''):
+    """Write rho, u, T spatial profiles to dat files with optional filename suffix."""
+    rho0 = float(N0) / (float(ncell) * rho1 * 0.5 + float(ncell) * rho2 * 0.5)
+    with open(os.path.join(outdir, f'rho{suffix}.dat'), 'w') as f200, \
+         open(os.path.join(outdir, f'u{suffix}.dat'), 'w') as f201, \
+         open(os.path.join(outdir, f'T{suffix}.dat'), 'w') as f202:
+        f200.write('variables="x/<greek>l</greek><sub>1","<greek>r</greek>"\n')
+        f201.write('variables="x/<greek>l</greek><sub>1","u"\n')
+        f202.write('variables="x/<greek>l</greek><sub>1","T"\n')
+        for i in range(ncell):
+            xx = float(i) * dx / lamda1
+            rho = float(np_cell[i]) / rho0 / float(n_sample_steps)
+            if np_cell[i] > 0:
+                uu = float(np.mean(ua[:np_cell[i], i]))
+                Tp = get_T(ua[:np_cell[i], i], va[:np_cell[i], i], wa[:np_cell[i], i], RR)
+            else:
+                uu = 0.0
+                Tp = 0.0
+            f200.write(f' {xx} {rho}\n')
+            f201.write(f' {xx} {uu}\n')
+            f202.write(f' {xx} {Tp}\n')
+
+
+def get_pdf_cell(ua, va, wa, np_cell, ipdf, outdir, n_sample_steps):
+    """Write velocity PDF for cell ipdf (0-based).
 
     ua, va, wa: accumulation arrays shaped (np_cell_max, ncell)
     np_cell: particle count per cell, shape (ncell,)
     ipdf: 0-based cell index for the PDF output
+    n_sample_steps: number of time steps used to accumulate samples
     """
     nbin = 201
     half = (nbin - 1) // 2  # 100
     binsize = 0.1 * beta1
-    rho0 = float(N0) / (float(ncell) * rho1 * 0.5 + float(ncell) * rho2 * 0.5)
 
     # File named with 1-based cell number to match Fortran output
     cell_num = ipdf + 1
@@ -286,44 +375,99 @@ def get_pdf_cell(ua, va, wa, np_cell, ipdf, outdir):
                 f101.write(f' {x} {pdf_u[i+half]} {pdf_v[i+half]} {pdf_w[i+half]}'
                            f' {pdf_ue1} {pdf_ue2} {pdf_ve1} {pdf_ve2}\n')
 
-    with open(os.path.join(outdir, 'rho.dat'), 'w') as f200, \
-         open(os.path.join(outdir, 'u.dat'), 'w') as f201, \
-         open(os.path.join(outdir, 'T.dat'), 'w') as f202:
-        f200.write('variables="x/<greek>l</greek><sub>1","<greek>r</greek>"\n')
-        f201.write('variables="x/<greek>l</greek><sub>1","u"\n')
-        f202.write('variables="x/<greek>l</greek><sub>1","T"\n')
-
-        for i in range(ncell):
-            xx = float(i) * dx / lamda1
-            rho = float(np_cell[i]) / rho0 / float(Nt_end - Nt_start + 1)
-            if np_cell[i] > 0:
-                uu = float(np.mean(ua[:np_cell[i], i]))
-                Tp = get_T(ua[:np_cell[i], i], va[:np_cell[i], i], wa[:np_cell[i], i], RR)
-            else:
-                uu = 0.0
-                Tp = 0.0
-            f200.write(f' {xx} {rho}\n')
-            f201.write(f' {xx} {uu}\n')
-            f202.write(f' {xx} {Tp}\n')
-
 
 # ===== Main Program =====
 
+def _run_step(i, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell,
+              ua, va, wa, np_cell, np_cell_max, accumulate):
+    """Execute one time step: inject, move, collide, optionally accumulate samples.
+    Returns np_count."""
+    p_in = int(N_in + 0.5)
+
+    inactive_slots = np.where(idx == 0)[0]
+    to_inject = min(p_in, len(inactive_slots))
+    for ji in range(to_inject):
+        j = inactive_slots[ji]
+        u[j] = u_ini(beta1, U1)
+        v[j] = gasdev(0.0, std1)
+        w[j] = gasdev(0.0, std1)
+        idx[j] = 1
+        x[j] = 0.0
+
+    active = (idx == 1)
+    x0 = x.copy()
+    x[active] += u[active] * dt
+    np_count = int(np.sum(active))
+
+    right = active & (x >= L_tube)
+    u[right] = 2.0 * U2 - u[right]
+    x[right] = 2.0 * L_tube - x0[right] + u[right] * dt
+
+    still_right = right & (x >= L_tube)
+    idx[still_right] = 0
+    cell[still_right] = -1
+    np_count -= int(np.sum(still_right))
+
+    left = active & ~right & (x < 0.0)
+    idx[left] = 0
+    cell[left] = -1
+    np_count -= int(np.sum(left))
+
+    still_active = (idx == 1)
+    raw_cells = (x[still_active] / L_tube * float(ncell)).astype(int)
+    cell[still_active] = np.clip(raw_cells, 0, ncell - 1)
+
+    for k in range(ncell):
+        collision(u, v, w, cell, k, cr_max, vol_cell)
+
+    if accumulate:
+        acc_idx = np.where(idx == 1)[0]
+        for ji in range(len(acc_idx)):
+            j = acc_idx[ji]
+            c = cell[j]
+            if np_cell[c] < np_cell_max:
+                ua[np_cell[c], c] = u[j]
+                va[np_cell[c], c] = v[j]
+                wa[np_cell[c], c] = w[j]
+                np_cell[c] += 1
+
+    return np_count
+
+
 def main():
+    args = parse_args()
+
+    # Determine sampling window size
+    if args.s:
+        if args.period is not None:
+            n_sample_steps = args.period
+        else:
+            n_sample_steps = Nt_end - int(Nt * 0.8) + 1
+        Nt_start = Nt_end - n_sample_steps + 1
+    else:  # -t mode
+        n_sample_steps = args.period
+
+    np_cell_max = int(float(Nmax) * float(n_sample_steps) / float(ncell) * 5.0)
+
     script_dir = str(Path(__file__).resolve().parent)
     outdir = script_dir + '/shock_output_' + datetime.now().strftime('%m%d%y_%H%M%S')
     os.makedirs(outdir)
+
+    tee = _Tee(os.path.join(outdir, 'run_info.txt'))
+    sys.stdout = tee
+    cmd = 'python ' + ' '.join([Path(sys.argv[0]).name] + sys.argv[1:])
+    print(cmd)
     print(f'Output directory: {outdir}')
 
     u = np.zeros(Nmax) # x velocity component array
     v = np.zeros(Nmax) # y
     w = np.zeros(Nmax) # z
     x = np.zeros(Nmax) # x position array
-    ua = np.zeros((np_cell_max, ncell)) #
-    va = np.zeros((np_cell_max, ncell)) #
-    wa = np.zeros((np_cell_max, ncell)) #
+    ua = np.zeros((np_cell_max, ncell))
+    va = np.zeros((np_cell_max, ncell))
+    wa = np.zeros((np_cell_max, ncell))
     np_cell = np.zeros(ncell, dtype=int)
-    idx = np.zeros(Nmax, dtype=int)     # idx[i] = 0 -> no particle with index i 
+    idx = np.zeros(Nmax, dtype=int)     # idx[i] = 0 -> no particle with index i
     cell = np.full(Nmax, -1, dtype=int)
     cr_max = np.zeros(ncell)
 
@@ -345,108 +489,138 @@ def main():
     print(f'mean collision time= {(float(N0) / float(ncell) * sigma_t * 2.0 * cm1)**(-1)}')
 
     # Initialize particles
-    prob = rho1 / (rho1 + rho2)    # probability the particle is upstream, given shock is in the center?
     std1 = 1.0 / (math.sqrt(2.0) * beta1) # upstream
     std2 = 1.0 / (math.sqrt(2.0) * beta2) # downstream
-    for j in range(N0):     
-        R1 = np.random.random()
-        R2 = np.random.random()
-        if R1 <= prob:
-            x[j] = R2 * L_tube / 2.0                   # place randomly on left side
-            u[j] = gasdev(0.0, std1) + U1              # with bulk velocity U1
-            v[j] = gasdev(0.0, std1)
-            w[j] = gasdev(0.0, std1)
-        else:
-            x[j] = R2 * L_tube / 2.0 + L_tube / 2.0    # place randomly on right side
-            u[j] = gasdev(0.0, std2) + U2              # with bulk velocity U2
-            v[j] = gasdev(0.0, std2)
-            w[j] = gasdev(0.0, std2)
-        idx[j] = 1
-        cell[j] = min(ncell - 1, int((x[j] / L_tube) * float(ncell)))
+    if not args.initialize_empty:
+        prob = rho1 / (rho1 + rho2)    # probability the particle is upstream, given shock is in the center?
+        for j in range(N0):
+            R1 = np.random.random()
+            R2 = np.random.random()
+            if R1 <= prob:
+                x[j] = R2 * L_tube / 2.0                   # place randomly on left side
+                u[j] = gasdev(0.0, std1) + U1              # with bulk velocity U1
+                v[j] = gasdev(0.0, std1)
+                w[j] = gasdev(0.0, std1)
+            else:
+                x[j] = R2 * L_tube / 2.0 + L_tube / 2.0    # place randomly on right side
+                u[j] = gasdev(0.0, std2) + U2              # with bulk velocity U2
+                v[j] = gasdev(0.0, std2)
+                w[j] = gasdev(0.0, std2)
+            idx[j] = 1
+            cell[j] = min(ncell - 1, int((x[j] / L_tube) * float(ncell)))
 
     np_count = 0
 
-    with open(os.path.join(outdir, 'npt.dat'), 'w') as f10:
-        f10.write('variables="t","Number of particles in the tube"\n')
+    if args.s:
+        # ----- Single batch mode -----
+        with open(os.path.join(outdir, 'npt.dat'), 'w') as f10:
+            f10.write('variables="t","Number of particles in the tube"\n')
 
-        for i in range(1, Nt + 1):
-            p_in = int(N_in + 0.5)     # N_in 
-            um = 0.0
+            if args.initialize_empty:
+                # Dynamic warmup: run until np_count falls below the count from 10 steps prior
+                history = collections.deque(maxlen=10)
+                i = 0
+                while True:
+                    i += 1
+                    np_count = _run_step(i, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell,
+                                         ua, va, wa, np_cell, np_cell_max, accumulate=False)
+                    f10.write(f' {i * dt} {float(np_count) / float(N0)}\n')
+                    print(f'warmup step= {i}  np= {np_count}')
+                    history.append(np_count)
+                    if len(history) == 10 and np_count < history[0]:
+                        break
+                # Sampling phase
+                for _ in range(n_sample_steps):
+                    i += 1
+                    np_count = _run_step(i, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell,
+                                         ua, va, wa, np_cell, np_cell_max, accumulate=True)
+                    f10.write(f' {i * dt} {float(np_count) / float(N0)}\n')
+                    print(f'step= {i}  np= {np_count}')
+            else:
+                for i in range(1, Nt + 1):
+                    accumulate = (Nt_start <= i <= Nt_end)
+                    np_count = _run_step(i, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell,
+                                         ua, va, wa, np_cell, np_cell_max, accumulate)
+                    f10.write(f' {i * dt} {float(np_count) / float(N0)}\n')
+                    print(f'step= {i}  np= {np_count}')
 
-            # Inject new particles into inactive slots, then move all active particles.
-            # (Mirrors Fortran's single pass: inject into idx==0, then move idx==1.)
-            inactive_slots = np.where(idx == 0)[0]
-            to_inject = min(p_in, len(inactive_slots))
-            for ji in range(to_inject):
-                j = inactive_slots[ji]
-                u[j] = u_ini(beta1, U1)
-                v[j] = gasdev(0.0, std1)
-                w[j] = gasdev(0.0, std1)
-                idx[j] = 1
-                x[j] = 0.0
+        print(np_cell / float(n_sample_steps))
+        print(f'particle number ratio (Np/N0) {float(np_count) / float(N0)}')
+        print(f'Np for cell statistics= {np_cell}')
+        print(f'Total particle number {N0}')
 
-            # Move all active particles
-            active = (idx == 1)
-            x0 = x.copy()
-            x[active] += u[active] * dt
-            np_count = int(np.sum(active))
+        write_spatial_profiles(ua, va, wa, np_cell, outdir, n_sample_steps)
+        for i in range(-30, 27, 2):
+            cell_idx = 92 + i  # 0-based equivalent of Fortran's (93 + i)
+            if 0 <= cell_idx < ncell:
+                get_pdf_cell(ua, va, wa, np_cell, cell_idx, outdir, n_sample_steps)
 
-            # Right boundary: reflect velocity around U2, recompute position
-            right = active & (x >= L_tube)
-            u[right] = 2.0 * U2 - u[right]
-            x[right] = 2.0 * L_tube - x0[right] + u[right] * dt
+    else:
+        # ----- Timeseries mode -----
+        with open(os.path.join(outdir, 'npt.dat'), 'w') as f_npt_global:
+            f_npt_global.write('variables="t","Number of particles in the tube"\n')
 
-            # Still past right boundary after reflection: remove
-            still_right = right & (x >= L_tube)
-            idx[still_right] = 0
-            cell[still_right] = -1
-            np_count -= int(np.sum(still_right))
+            # Warmup phase
+            if args.initialize_empty:
+                # Dynamic warmup: run until np_count falls below the count from 10 steps prior
+                history = collections.deque(maxlen=10)
+                warmup_end = 0
+                while True:
+                    warmup_end += 1
+                    np_count = _run_step(warmup_end, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell,
+                                         ua, va, wa, np_cell, np_cell_max, accumulate=False)
+                    f_npt_global.write(f' {warmup_end * dt} {float(np_count) / float(N0)}\n')
+                    print(f'warmup step= {warmup_end}  np= {np_count}')
+                    history.append(np_count)
+                    if len(history) == 10 and np_count < history[0]:
+                        break
+            else:
+                for warmup_end in range(1, Nt_end + 1):
+                    np_count = _run_step(warmup_end, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell,
+                                         ua, va, wa, np_cell, np_cell_max, accumulate=False)
+                    f_npt_global.write(f' {warmup_end * dt} {float(np_count) / float(N0)}\n')
+                    print(f'warmup step= {warmup_end}  np= {np_count}')
 
-            # Left boundary: remove particles that exit
-            left = active & ~right & (x < 0.0)
-            idx[left] = 0
-            cell[left] = -1
-            np_count -= int(np.sum(left))
+            # Timeseries phase: one output set per period, with optional gaps between periods
+            gap = args.gap
+            stride = args.period + gap  # steps consumed per period slot
+            for p in range(1, args.num_periods + 1):
+                ua[:] = 0.0
+                va[:] = 0.0
+                wa[:] = 0.0
+                np_cell[:] = 0
 
-            # Update cell assignments for remaining active particles
-            still_active = (idx == 1)
-            raw_cells = (x[still_active] / L_tube * float(ncell)).astype(int)
-            cell[still_active] = np.clip(raw_cells, 0, ncell - 1)
+                with open(os.path.join(outdir, f'npt_{p}.dat'), 'w') as f_npt_p:
+                    f_npt_p.write('variables="t","Number of particles in the tube"\n')
 
-            # Collision step for each cell
-            for k in range(ncell):
-                collision(u, v, w, cell, k, cr_max, vol_cell)
+                    for local_step in range(1, args.period + 1):
+                        global_step = warmup_end + (p - 1) * stride + local_step
+                        np_count = _run_step(global_step, u, v, w, x, idx, cell, cr_max,
+                                             std1, N_in, vol_cell,
+                                             ua, va, wa, np_cell, np_cell_max, accumulate=True)
+                        f_npt_global.write(f' {global_step * dt} {float(np_count) / float(N0)}\n')
+                        f_npt_p.write(f' {local_step * dt} {float(np_count) / float(N0)}\n')
+                        print(f'period= {p}  step= {local_step}  np= {np_count}')
 
-            f10.write(f' {i * dt} {float(np_count) / float(N0)}\n')
-            print(f'step= {i}  np= {np_count}')
+                write_spatial_profiles(ua, va, wa, np_cell, outdir, n_sample_steps, suffix=f'_{p}')
+                print(f'period= {p}  particle number ratio (Np/N0) {float(np_count) / float(N0)}')
 
-            # Accumulate velocity samples for statistics
-            if Nt_start <= i <= Nt_end:
-                acc_idx = np.where(idx == 1)[0]
-                for ji in range(len(acc_idx)):
-                    j = acc_idx[ji]
-                    c = cell[j]
-                    if np_cell[c] < np_cell_max:
-                        ua[np_cell[c], c] = u[j]
-                        va[np_cell[c], c] = v[j]
-                        wa[np_cell[c], c] = w[j]
-                        np_cell[c] += 1
+                # Gap phase: run between periods (skip after the last period)
+                if gap > 0 and p < args.num_periods:
+                    for gap_step in range(1, gap + 1):
+                        global_step = warmup_end + (p - 1) * stride + args.period + gap_step
+                        np_count = _run_step(global_step, u, v, w, x, idx, cell, cr_max,
+                                             std1, N_in, vol_cell,
+                                             ua, va, wa, np_cell, np_cell_max, accumulate=False)
+                        f_npt_global.write(f' {global_step * dt} {float(np_count) / float(N0)}\n')
+                        print(f'period= {p}  gap step= {gap_step}  np= {np_count}')
 
-    print(np_cell / float(Nt_end - Nt_start + 1))
-    print(f'particle number ratio (Np/N0) {float(np_count) / float(N0)}')
-    print(f'um= {um}')
-    print(f'Np for cell statistics= {np_cell}')
-    print(f'Total particle number {N0}')
+        print(f'Total particle number {N0}')
 
-    # Write PDF output for cells near the shock (0-based: Fortran cells 63..119 => indices 62..118)
-    for i in range(-30, 27, 2):
-        cell_idx = 92 + i  # 0-based equivalent of Fortran's (93 + i)
-        if 0 <= cell_idx < ncell:
-            get_pdf_cell(ua, va, wa, np_cell, cell_idx, outdir)
+    end_time = datetime.now()
+    print('Elapsed time:', end_time - start_time)
+    tee.close()
 
 
 if __name__ == '__main__':
     main()
-    end_time = datetime.now()
-    elapsed = end_time - start_time
-    print('Elapsed time:' , elapsed)
