@@ -17,10 +17,10 @@ start_time = datetime.now()
 # ===== Parameters =====
 
 pi = math.pi
-s = 2.0          # ratio of bulk flow to most probable speed
+s = 4.0          # ratio of bulk flow to most probable speed
 beta1 = 1.0      # inverse of most probable speed
 U1 = s / beta1   # bulk flow velocity
-n = 5000         # particles per unit volume
+n = 500         # particles per unit volume
 
 # Physical parameters
 Ru = 8.314472      # gas constant
@@ -398,8 +398,10 @@ def _run_step(i, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell,
     np_count = int(np.sum(active))
 
     right = active & (x >= L_tube)
+    u_old_right = u[right].copy()
     u[right] = 2.0 * U2 - u[right]
-    x[right] = 2.0 * L_tube - x0[right] + u[right] * dt
+    t_c = (L_tube - x0[right]) / u_old_right
+    x[right] = L_tube + u[right] * (dt - t_c)
 
     still_right = right & (x >= L_tube)
     idx[still_right] = 0
