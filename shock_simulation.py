@@ -217,9 +217,9 @@ def collision(u, v, w, cell, cell_no, cr_max, vol_cell):
     if nc < 2:
         return
 
-    uc = u[pc].copy()
-    vc = v[pc].copy()
-    wc = w[pc].copy()
+    u_cell = u[pc].copy()
+    v_cell = v[pc].copy()
+    w_cell = w[pc].copy()
 
     Nt_colli = int(0.5 * nc * (nc - 1.0) * (sigma_t * cr_max[cell_no]) * dt * Wt / (vol_cell * AVOG)) # number of collisions
     Nt_colli = max(0, Nt_colli)
@@ -230,47 +230,42 @@ def collision(u, v, w, cell, cell_no, cr_max, vol_cell):
         if pp1 == pp2:
             continue
 
-        cr_x = uc[pp1] - uc[pp2]
-        cr_y = vc[pp1] - vc[pp2]
-        cr_z = wc[pp1] - wc[pp2]
-        cr = math.sqrt(cr_x**2 + cr_y**2 + cr_z**2)
+        c_rel_x = u_cell[pp1] - u_cell[pp2]
+        c_rel_y = v_cell[pp1] - v_cell[pp2]
+        c_rel_z = w_cell[pp1] - w_cell[pp2]
+        c_rel = math.sqrt(c_rel_x**2 + c_rel_y**2 + c_rel_z**2)
 
-        P_accept = cr * sigma_t / max(cr_max[cell_no], 1.0e-12) / sigma_max
+        P_accept = c_rel * sigma_t / max(cr_max[cell_no], 1.0e-12) / sigma_max
         P_accept = min(max(P_accept, 0.0), 1.0)
 
         if np.random.random() <= P_accept:
-            theta = 2.0 * pi * np.random.random()             # uniformly random in theta
-            psi = math.acos(1.0 - 2.0 * np.random.random())   # not uniformly random in psi
+            theta = 2.0 * pi * np.random.random()             # azimuthal angle
+            psi = math.acos(1.0 - 2.0 * np.random.random())   # polar angle
 
-            # original
-            crt_x = cr * math.cos(theta) * math.sin(psi)
-            crt_y = cr * math.sin(theta) * math.sin(psi)
-            crt_z = cr * math.cos(psi)
+            cprime_rel_x = c_rel * math.cos(theta) * math.sin(psi)
+            cprime_rel_y = c_rel * math.sin(theta) * math.sin(psi)
+            cprime_rel_z = c_rel * math.cos(psi)
 
-            #crt_x = cr * math.cos(psi)
-            #crt_y = cr * math.cos(theta) * math.sin(psi)
-            #crt_z = cr * math.sin(theta) * math.sin(psi)
+            u_center = 0.5 * (u_cell[pp1] + u_cell[pp2])
+            v_center = 0.5 * (v_cell[pp1] + v_cell[pp2])
+            w_center = 0.5 * (w_cell[pp1] + w_cell[pp2])
 
-            cm_x = 0.5 * (uc[pp1] + uc[pp2])
-            cm_y = 0.5 * (vc[pp1] + vc[pp2])
-            cm_z = 0.5 * (wc[pp1] + wc[pp2])
+            u_cell[pp1] = u_center + 0.5 * cprime_rel_x
+            v_cell[pp1] = v_center + 0.5 * cprime_rel_y
+            w_cell[pp1] = w_center + 0.5 * cprime_rel_z
+            u_cell[pp2] = u_center - 0.5 * cprime_rel_x
+            v_cell[pp2] = v_center - 0.5 * cprime_rel_y
+            w_cell[pp2] = w_center - 0.5 * cprime_rel_z
 
-            uc[pp1] = cm_x + 0.5 * crt_x
-            vc[pp1] = cm_y + 0.5 * crt_y
-            wc[pp1] = cm_z + 0.5 * crt_z
-            uc[pp2] = cm_x - 0.5 * crt_x
-            vc[pp2] = cm_y - 0.5 * crt_y
-            wc[pp2] = cm_z - 0.5 * crt_z
+            c_rel_x = u_cell[pp1] - u_cell[pp2]
+            c_rel_y = v_cell[pp1] - v_cell[pp2]
+            c_rel_z = w_cell[pp1] - w_cell[pp2]
+            c_rel = math.sqrt(c_rel_x**2 + c_rel_y**2 + c_rel_z**2)
+            cr_max[cell_no] = max(c_rel, cr_max[cell_no])
 
-            cr_x = uc[pp1] - uc[pp2]
-            cr_y = vc[pp1] - vc[pp2]
-            cr_z = wc[pp1] - wc[pp2]
-            cr = math.sqrt(cr_x**2 + cr_y**2 + cr_z**2)
-            cr_max[cell_no] = max(cr, cr_max[cell_no])
-
-    u[pc] = uc
-    v[pc] = vc
-    w[pc] = wc
+    u[pc] = u_cell
+    v[pc] = v_cell
+    w[pc] = w_cell
 
 
 def write_spatial_profiles(ua, va, wa, np_cell, outdir, n_sample_steps, suffix=''):
