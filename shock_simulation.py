@@ -20,7 +20,7 @@ pi = math.pi
 s = 4.0          # ratio of bulk flow to most probable speed
 beta1 = 1.0      # inverse of most probable speed
 U1 = s / beta1   # bulk flow velocity
-n = 500         # particles per unit volume
+n = 500          # particles per unit volume
 
 # Physical parameters
 Ru = 8.314472      # gas constant
@@ -64,9 +64,8 @@ Nt = 100
 L_tube = dx * ncell
 N0 = int(n * area * L_tube)
 Nmax = int(1.2 * N0)
-Nreal = ((rho1 + rho2) / mm) * AVOG * 60.0 * (lamda1 / 2.0) * area
+Nreal = ((2.0 * rho1 + rho2) / mm) * AVOG * 20.0 * lamda1 * area
 Wt = Nreal / N0      # scaling factor simulated # to real #?
-cell_stat = 92
 Nt_end = Nt
 
 
@@ -276,7 +275,7 @@ def collision(u, v, w, cell, cell_no, cr_max, vol_cell):
 
 def write_spatial_profiles(ua, va, wa, np_cell, outdir, n_sample_steps, suffix=''):
     """Write rho, u, T spatial profiles to dat files with optional filename suffix."""
-    rho0 = float(N0) / (float(ncell) * rho1 * 0.5 + float(ncell) * rho2 * 0.5)
+    rho0 = float(N0) / (float(ncell) * (2.0 / 3.0) * rho1 + float(ncell) * (1.0 / 3.0) * rho2)
     with open(os.path.join(outdir, f'rho{suffix}.dat'), 'w') as f200, \
          open(os.path.join(outdir, f'u{suffix}.dat'), 'w') as f201, \
          open(os.path.join(outdir, f'T{suffix}.dat'), 'w') as f202:
@@ -384,7 +383,7 @@ def _run_step(i, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell,
 
     inactive_slots = np.where(idx == 0)[0]
     to_inject = min(p_in, len(inactive_slots))
-    for ji in range(to_inject):
+    for ji in range(to_inject):           # inject particles
         j = inactive_slots[ji]
         u[j] = u_ini(beta1, U1)
         v[j] = gasdev(0.0, std1)
@@ -394,33 +393,33 @@ def _run_step(i, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell,
 
     active = (idx == 1)
     x0 = x.copy()
-    x[active] += u[active] * dt
+    x[active] += u[active] * dt           # move particles to new x positions
     np_count = int(np.sum(active))
 
-    right = active & (x >= L_tube)
+    right = active & (x >= L_tube)        # collide with right boundary
     u_old_right = u[right].copy()
     u[right] = 2.0 * U2 - u[right]
     t_c = (L_tube - x0[right]) / u_old_right
     x[right] = L_tube + u[right] * (dt - t_c)
 
-    still_right = right & (x >= L_tube)
+    still_right = right & (x >= L_tube)   # remove at right boundary
     idx[still_right] = 0
     cell[still_right] = -1
     np_count -= int(np.sum(still_right))
 
-    left = active & ~right & (x < 0.0)
+    left = active & ~right & (x < 0.0)    # remove at left boundary
     idx[left] = 0
     cell[left] = -1
     np_count -= int(np.sum(left))
 
-    still_active = (idx == 1)
+    still_active = (idx == 1)             # update cell array, where cell[i] = j -> particle i is in cell j 
     raw_cells = (x[still_active] / L_tube * float(ncell)).astype(int)
     cell[still_active] = np.clip(raw_cells, 0, ncell - 1)
 
-    for k in range(ncell):
+    for k in range(ncell):                # do collisions cell by cell
         collision(u, v, w, cell, k, cr_max, vol_cell)
 
-    if accumulate:
+    if accumulate:                        # true if period is active, i.e. not in warmup or gap
         acc_idx = np.where(idx == 1)[0]
         for ji in range(len(acc_idx)):
             j = acc_idx[ji]
@@ -474,7 +473,7 @@ def main():
     cr_max1 = 2.0 * cm1
     cr_max2 = 2.0 * cm2
     for i in range(ncell): # iterate over the length, ncell * dx = length
-        cr_max[i] = cr_max1 if i < ncell // 2 else cr_max2
+        cr_max[i] = cr_max1 if i < ncell * 2 // 3 else cr_max2
 
     vol_cell = area * dx
 
@@ -492,17 +491,17 @@ def main():
     std1 = 1.0 / (math.sqrt(2.0) * beta1) # upstream
     std2 = 1.0 / (math.sqrt(2.0) * beta2) # downstream
     if not args.initialize_empty:
-        prob = rho1 / (rho1 + rho2)    # probability the particle is upstream, given shock is in the center?
+        prob = 2.0 * rho1 / (2.0 * rho1 + rho2)    # probability the particle is upstream (shock at 2/3)
         for j in range(N0):
             R1 = np.random.random()
             R2 = np.random.random()
             if R1 <= prob:
-                x[j] = R2 * L_tube / 2.0                   # place randomly on left side
+                x[j] = R2 * 2.0 * L_tube / 3.0             # place randomly on left 2/3
                 u[j] = gasdev(0.0, std1) + U1              # with bulk velocity U1
                 v[j] = gasdev(0.0, std1)
                 w[j] = gasdev(0.0, std1)
             else:
-                x[j] = R2 * L_tube / 2.0 + L_tube / 2.0    # place randomly on right side
+                x[j] = R2 * L_tube / 3.0 + 2.0 * L_tube / 3.0  # place randomly on right 1/3
                 u[j] = gasdev(0.0, std2) + U2              # with bulk velocity U2
                 v[j] = gasdev(0.0, std2)
                 w[j] = gasdev(0.0, std2)
@@ -551,7 +550,7 @@ def main():
 
         write_spatial_profiles(ua, va, wa, np_cell, outdir, n_sample_steps)
         for i in range(-30, 27, 2):
-            cell_idx = 92 + i  # 0-based equivalent of Fortran's (93 + i)
+            cell_idx = 123 + i  # centred on shock position at 2*L_tube/3
             if 0 <= cell_idx < ncell:
                 get_pdf_cell(ua, va, wa, np_cell, cell_idx, outdir, n_sample_steps)
 
