@@ -63,7 +63,7 @@ dt = 0.5 * lamda2 / cm2
 Nt = 1000
 L_tube = dx * ncell
 N0 = int(n * area * L_tube)
-Nmax = int(3.0 * N0)  # revert before commit
+Nmax = int(3.0 * N0)
 Nreal = ((2.0 * rho1 + rho2) / mm) * AVOG * 20.0 * lamda1 * area
 Wt = Nreal / N0      # scaling factor simulated # to real #?
 
