@@ -28,19 +28,24 @@ import matplotlib.cm as cm
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 
+OUTPUT_ROOT = SCRIPT_DIR / 'output'
+PLOTS_ROOT  = SCRIPT_DIR / 'plots'
+
+
 def find_output_dir(folder_arg=None):
     """Return the output directory to use."""
     if folder_arg is not None:
         p = Path(folder_arg)
         if not p.is_dir():
-            # Try relative to the script directory as a fallback
+            p = OUTPUT_ROOT / folder_arg
+        if not p.is_dir():
             p = SCRIPT_DIR / folder_arg
         if not p.is_dir():
             sys.exit(f'Error: folder "{folder_arg}" not found.')
         return str(p)
-    dirs = sorted(SCRIPT_DIR.glob('shock_output_*'), key=os.path.getmtime)
+    dirs = sorted(OUTPUT_ROOT.glob('shock_output_*'), key=os.path.getmtime)
     if not dirs:
-        sys.exit(f'Error: no shock_output_* folders found in {SCRIPT_DIR}')
+        sys.exit(f'Error: no shock_output_* folders found in {OUTPUT_ROOT}')
     return str(dirs[-1])
 
 
@@ -87,8 +92,34 @@ def plot_npt(outdir):
     data = load_dat(path)
     t, ratio = data[:, 0], data[:, 1]
 
-    _, ax = plt.subplots(figsize=(7, 4))
-    ax.plot(t, ratio, linewidth=1.2)
+    fig, ax = plt.subplots(figsize=(8, 4))
+    line1, = ax.plot(t, ratio, color='tab:blue', linewidth=1.2, label=r'$N_p/N_0$')
+
+    # Overlay right-boundary removal rate if available (5-step moving average)
+    rr_path = os.path.join(outdir, 'removed_right.dat')
+    if os.path.isfile(rr_path):
+        rr_data = load_dat(rr_path)
+        kernel = np.ones(10) / 10
+        # mode='valid' gives N-9 values, each a fully-windowed average;
+        # rr_smooth[k] = mean of steps k..k+9, associated with time rr_data[k+9]
+        rr_smooth = np.convolve(rr_data[:, 1], kernel, mode='valid')
+        t_smooth = rr_data[9:, 0]          # time of last element in each window
+        rr_smooth = rr_smooth[10:-10]      # drop first and last 10 averages
+        t_smooth  = t_smooth[10:-10]
+        # Set both y-axes so that y=1 is centred at the same vertical level
+        pad = 1.15  # 15% headroom beyond the max deviation from 1
+        dev1 = max(abs(ratio - 1).max(), 1e-6) * pad
+        dev2 = max(abs(rr_smooth - 1).max(), 1e-6) * pad
+        ax.set_ylim(1 - dev1, 1 + dev1)
+
+        ax2 = ax.twinx()
+        line2, = ax2.plot(t_smooth, rr_smooth, color='tab:orange',
+                          linewidth=1.0, alpha=0.8, label=r'removed / $N_{in}$ (10-step avg)')
+        ax2.set_ylim(1 - dev2, 1 + dev2)
+        ax2.set_ylabel(r'removed / $N_{in}$', color='tab:orange')
+        ax2.tick_params(axis='y', labelcolor='tab:orange')
+        lines = [line1, line2]
+        ax.legend(lines, [l.get_label() for l in lines], fontsize=8)
 
     # In timeseries mode, draw separators at period boundaries
     period_npt_files = get_period_files(outdir, 'npt')
@@ -99,18 +130,17 @@ def plot_npt(outdir):
         stride = period_steps + gap
         warmup_steps = len(t) - num_periods * period_steps - (num_periods - 1) * gap
         for p in range(num_periods):
-            # Bar at the start of each period (also marks end of warmup / end of gap)
             start_idx = warmup_steps + p * stride
             if 0 <= start_idx < len(t):
                 ax.axvline(t[start_idx], color='gray', linewidth=0.7, linestyle='--', alpha=0.7)
-            # Bar at the end of each period where a gap follows
             if gap > 0 and p < num_periods - 1:
                 end_idx = warmup_steps + p * stride + period_steps
                 if 0 <= end_idx < len(t):
                     ax.axvline(t[end_idx], color='gray', linewidth=0.7, linestyle='--', alpha=0.7)
 
     ax.set_xlabel('Time')
-    ax.set_ylabel(r'$N_p \/ / \/ N_0$')
+    ax.set_ylabel(r'$N_p \/ / \/ N_0$', color='tab:blue')
+    ax.tick_params(axis='y', labelcolor='tab:blue')
     ax.set_title(f'Particle count in tube\n{Path(outdir).name}')
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
@@ -173,6 +203,36 @@ def plot_u(outdir):
     ax.set_xlabel(r'$x \/ / \/ \lambda_1$')
     ax.set_ylabel(r'$\langle u \rangle$')
     ax.set_title(f'Mean x-velocity profile\n{Path(outdir).name}')
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+
+
+def plot_flux(outdir):
+    if is_timeseries(outdir):
+        rho_files = get_period_files(outdir, 'rho')
+        u_files   = get_period_files(outdir, 'u')
+        if not rho_files:
+            print(f'No rho_N.dat files found in {Path(outdir).name}')
+            return
+        n = len(rho_files)
+        colors = cm.viridis(np.linspace(0, 1, n))
+        _, ax = plt.subplots(figsize=(8, 5))
+        for rf, uf, color in zip(rho_files, u_files, colors):
+            rho_data = load_dat(rf)
+            u_data   = load_dat(uf)
+            ax.plot(rho_data[:, 0], rho_data[:, 1] * u_data[:, 1], color=color, linewidth=1.0)
+        sm = plt.cm.ScalarMappable(cmap='viridis', norm=plt.Normalize(1, n))
+        sm.set_array([])
+        plt.colorbar(sm, ax=ax, label='period')
+        ax.set_title(f'Mass flux profile — timeseries ({n} periods)\n{Path(outdir).name}')
+    else:
+        rho_data = load_dat(os.path.join(outdir, 'rho.dat'))
+        u_data   = load_dat(os.path.join(outdir, 'u.dat'))
+        _, ax = plt.subplots(figsize=(7, 4))
+        ax.plot(rho_data[:, 0], rho_data[:, 1] * u_data[:, 1], linewidth=1.2)
+        ax.set_title(f'Mass flux profile\n{Path(outdir).name}')
+    ax.set_xlabel(r'$x \/ / \/ \lambda_1$')
+    ax.set_ylabel(r'$\rho u$')
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
 
@@ -264,11 +324,12 @@ def plot_pdf(outdir):
 # ---------------------------------------------------------------------------
 
 PLOT_FUNCS = {
-    'npt': plot_npt,
-    'rho': plot_rho,
-    'u':   plot_u,
-    'T':   plot_T,
-    'pdf': plot_pdf,
+    'npt':  plot_npt,
+    'rho':  plot_rho,
+    'u':    plot_u,
+    'T':    plot_T,
+    'flux': plot_flux,
+    'pdf':  plot_pdf,
 }
 
 VALID_TYPES = list(PLOT_FUNCS.keys()) + ['all']
@@ -289,7 +350,8 @@ def main():
 
     # Derive plots folder from the datetime embedded in the output folder name
     datetime_suffix = Path(outdir).name[len('shock_output_'):]
-    plots_dir = SCRIPT_DIR / f'plots_{datetime_suffix}'
+    PLOTS_ROOT.mkdir(exist_ok=True)
+    plots_dir = PLOTS_ROOT / f'plots_{datetime_suffix}'
     plots_dir.mkdir(exist_ok=True)
 
     to_plot = list(PLOT_FUNCS.keys()) if plot_type == 'all' else [plot_type]

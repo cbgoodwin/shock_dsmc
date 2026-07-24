@@ -17,9 +17,9 @@ start_time = datetime.now()
 # ===== Parameters =====
 
 pi = math.pi
-s = 4.0          # ratio of bulk flow to most probable speed
+s = 2.0          # ratio of bulk flow to most probable speed
 beta1 = 1.0      # inverse of most probable speed
-U1 = s / beta1   # bulk flow velocity
+U1 = s / beta1   # bulk flow velocity in terms of upstream most probable speed
 n = 500          # particles per unit volume
 
 # Physical parameters
@@ -37,7 +37,7 @@ area = 1.0     # cross section area of tube
 RR = 1.0 / (2.0 * Tp1 * beta1**2)  # specific gas constant
 mm = Ru / RR                       # molar mass
 dm1 = math.sqrt(5.0 * mm * math.sqrt(RR * Tp1 / pi) / (16.0 * mu1))    # hard sphere diameter
-sigma_t = pi * dm1                                                     # collision cross section?
+sigma_t = pi * dm1**2                                                  # hard sphere collision cross section
 cm1 = 2.0 / (math.sqrt(pi) * beta1)   # mean molecular speed
 lamda1 = cm1 * rho1 / mu1             # mean free path
 a1 = math.sqrt(gamma * RR * Tp1)      # speed of sound
@@ -60,13 +60,12 @@ deltaU = U1 - U2
 dx = 0.365961
 ncell = 185
 dt = 0.5 * lamda2 / cm2
-Nt = 100
+Nt = 1000
 L_tube = dx * ncell
 N0 = int(n * area * L_tube)
-Nmax = int(1.2 * N0)
+Nmax = int(3.0 * N0)
 Nreal = ((2.0 * rho1 + rho2) / mm) * AVOG * 20.0 * lamda1 * area
 Wt = Nreal / N0      # scaling factor simulated # to real #?
-Nt_end = Nt
 
 
 class _Tee:
@@ -114,6 +113,8 @@ def parse_args():
                         help='Start with an empty tube; particles enter only via inflow')
     parser.add_argument('-gap', type=int, default=0,
                         help='Steps between periods in timeseries mode (positive integer, -t only)')
+    parser.add_argument('-warmup', type=int, default=1000,
+                        help='Number of warmup timesteps before sampling/periods (default: 1000)')
     args = parser.parse_args()
 
     if args.t:
@@ -210,7 +211,6 @@ def get_T(u_arr, v_arr, w_arr, RR_in):
 
 def collision(u, v, w, cell, cell_no, cr_max, vol_cell):
     """DSMC collision step for a single cell (0-based cell_no)."""
-    sigma_max = sigma_t
 
     pc = np.where(cell == cell_no)[0]  # get indices of all particles in the cell
     nc = len(pc)
@@ -235,7 +235,7 @@ def collision(u, v, w, cell, cell_no, cr_max, vol_cell):
         c_rel_z = w_cell[pp1] - w_cell[pp2]
         c_rel = math.sqrt(c_rel_x**2 + c_rel_y**2 + c_rel_z**2)
 
-        P_accept = c_rel * sigma_t / max(cr_max[cell_no], 1.0e-12) / sigma_max
+        P_accept = c_rel / max(cr_max[cell_no], 1.0e-12)
         P_accept = min(max(P_accept, 0.0), 1.0)
 
         if np.random.random() <= P_accept:
@@ -373,7 +373,7 @@ def get_pdf_cell(ua, va, wa, np_cell, ipdf, outdir, n_sample_steps):
 def _run_step(i, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell,
               ua, va, wa, np_cell, np_cell_max, accumulate):
     """Execute one time step: inject, move, collide, optionally accumulate samples.
-    Returns np_count."""
+    Returns (np_count, n_removed_right)."""
     p_in = int(N_in + 0.5)
 
     inactive_slots = np.where(idx == 0)[0]
@@ -387,20 +387,27 @@ def _run_step(i, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell,
         x[j] = 0.0
 
     active = (idx == 1)
-    x0 = x.copy()
+    x0 = x.copy()                         # x0 contains old positions
     x[active] += u[active] * dt           # move particles to new x positions
     np_count = int(np.sum(active))
 
-    right = active & (x >= L_tube)        # collide with right boundary
-    u_old_right = u[right].copy()
-    u[right] = 2.0 * U2 - u[right]
-    t_c = (L_tube - x0[right]) / u_old_right
-    x[right] = L_tube + u[right] * (dt - t_c)
+    right = active & (x >= L_tube)        # indices of particles that collide with right boundary
+    
+    # collide with right boundary, Pullin paper method (uncomment next four lines)
+    #u_old_right = u[right].copy()
+    #u[right] = 2.0 * U2 - u[right]        # update the velocities
+    #t_c = (L_tube - x0[right]) / u_old_right
+    #x[right] = L_tube + u[right] * (dt - t_c)
+
+    # collide with right boundary, Fortran code method (uncomment next two lines)
+    u[right] = 2.0 * U2 - u[right]        # update the velocities
+    x[right] = 2.0 * L_tube - x0[right] + u[right] * dt
 
     still_right = right & (x >= L_tube)   # remove at right boundary
+    n_removed_right = int(np.sum(still_right))
     idx[still_right] = 0
     cell[still_right] = -1
-    np_count -= int(np.sum(still_right))
+    np_count -= n_removed_right
 
     left = active & ~right & (x < 0.0)    # remove at left boundary
     idx[left] = 0
@@ -425,7 +432,7 @@ def _run_step(i, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell,
                 wa[np_cell[c], c] = w[j]
                 np_cell[c] += 1
 
-    return np_count
+    return np_count, n_removed_right
 
 
 def main():
@@ -436,15 +443,18 @@ def main():
         if args.period is not None:
             n_sample_steps = args.period
         else:
-            n_sample_steps = Nt_end - int(Nt * 0.8) + 1
-        Nt_start = Nt_end - n_sample_steps + 1
+            n_sample_steps = Nt - int(Nt * 0.8) + 1
+        Nt_start = args.warmup + 1
+        Nt_end   = args.warmup + n_sample_steps
     else:  # -t mode
         n_sample_steps = args.period
 
     np_cell_max = int(float(Nmax) * float(n_sample_steps) / float(ncell) * 5.0)
 
-    script_dir = str(Path(__file__).resolve().parent)
-    outdir = script_dir + '/shock_output_' + datetime.now().strftime('%m%d%y_%H%M%S')
+    script_dir = Path(__file__).resolve().parent
+    output_root = script_dir / 'output'
+    output_root.mkdir(exist_ok=True)
+    outdir = str(output_root / ('shock_output_' + datetime.now().strftime('%m%d%y_%H%M%S')))
     os.makedirs(outdir)
 
     tee = _Tee(os.path.join(outdir, 'run_info.txt'))
@@ -507,8 +517,10 @@ def main():
 
     if args.s:
         # ----- Single batch mode -----
-        with open(os.path.join(outdir, 'npt.dat'), 'w') as f10:
+        with open(os.path.join(outdir, 'npt.dat'), 'w') as f10, \
+             open(os.path.join(outdir, 'removed_right.dat'), 'w') as f_rr:
             f10.write('variables="t","Number of particles in the tube"\n')
+            f_rr.write('variables="t","removed/N_in"\n')
 
             if args.initialize_empty:
                 # Dynamic warmup: run until np_count falls below the count from 10 steps prior
@@ -516,27 +528,32 @@ def main():
                 i = 0
                 while True:
                     i += 1
-                    np_count = _run_step(i, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell,
+                    np_count, n_rr = _run_step(i, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell,
                                          ua, va, wa, np_cell, np_cell_max, accumulate=False)
                     f10.write(f' {i * dt} {float(np_count) / float(N0)}\n')
+                    f_rr.write(f' {i * dt} {float(n_rr) / N_in}\n')
                     print(f'warmup step= {i}  np= {np_count}')
                     history.append(np_count)
                     if len(history) == 10 and np_count < history[0]:
                         break
+                print(f'Warmup complete: {i} steps (dynamic)')
                 # Sampling phase
                 for _ in range(n_sample_steps):
                     i += 1
-                    np_count = _run_step(i, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell,
+                    np_count, n_rr = _run_step(i, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell,
                                          ua, va, wa, np_cell, np_cell_max, accumulate=True)
                     f10.write(f' {i * dt} {float(np_count) / float(N0)}\n')
+                    f_rr.write(f' {i * dt} {float(n_rr) / N_in}\n')
                     print(f'step= {i}  np= {np_count}')
             else:
-                for i in range(1, Nt + 1):
+                for i in range(1, Nt_end + 1):
                     accumulate = (Nt_start <= i <= Nt_end)
-                    np_count = _run_step(i, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell,
+                    np_count, n_rr = _run_step(i, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell,
                                          ua, va, wa, np_cell, np_cell_max, accumulate)
                     f10.write(f' {i * dt} {float(np_count) / float(N0)}\n')
+                    f_rr.write(f' {i * dt} {float(n_rr) / N_in}\n')
                     print(f'step= {i}  np= {np_count}')
+                print(f'Warmup complete: {args.warmup} steps')
 
         print(np_cell / float(n_sample_steps))
         print(f'particle number ratio (Np/N0) {float(np_count) / float(N0)}')
@@ -551,8 +568,10 @@ def main():
 
     else:
         # ----- Timeseries mode -----
-        with open(os.path.join(outdir, 'npt.dat'), 'w') as f_npt_global:
+        with open(os.path.join(outdir, 'npt.dat'), 'w') as f_npt_global, \
+             open(os.path.join(outdir, 'removed_right.dat'), 'w') as f_rr:
             f_npt_global.write('variables="t","Number of particles in the tube"\n')
+            f_rr.write('variables="t","removed/N_in"\n')
 
             # Warmup phase
             if args.initialize_empty:
@@ -561,19 +580,23 @@ def main():
                 warmup_end = 0
                 while True:
                     warmup_end += 1
-                    np_count = _run_step(warmup_end, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell,
+                    np_count, n_rr = _run_step(warmup_end, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell,
                                          ua, va, wa, np_cell, np_cell_max, accumulate=False)
                     f_npt_global.write(f' {warmup_end * dt} {float(np_count) / float(N0)}\n')
+                    f_rr.write(f' {warmup_end * dt} {float(n_rr) / N_in}\n')
                     print(f'warmup step= {warmup_end}  np= {np_count}')
                     history.append(np_count)
                     if len(history) == 10 and np_count < history[0]:
                         break
+                print(f'Warmup complete: {warmup_end} steps (dynamic)')
             else:
-                for warmup_end in range(1, Nt_end + 1):
-                    np_count = _run_step(warmup_end, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell,
+                for warmup_end in range(1, args.warmup + 1):
+                    np_count, n_rr = _run_step(warmup_end, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell,
                                          ua, va, wa, np_cell, np_cell_max, accumulate=False)
                     f_npt_global.write(f' {warmup_end * dt} {float(np_count) / float(N0)}\n')
+                    f_rr.write(f' {warmup_end * dt} {float(n_rr) / N_in}\n')
                     print(f'warmup step= {warmup_end}  np= {np_count}')
+                print(f'Warmup complete: {args.warmup} steps')
 
             # Timeseries phase: one output set per period, with optional gaps between periods
             gap = args.gap
@@ -589,10 +612,11 @@ def main():
 
                     for local_step in range(1, args.period + 1):
                         global_step = warmup_end + (p - 1) * stride + local_step
-                        np_count = _run_step(global_step, u, v, w, x, idx, cell, cr_max,
+                        np_count, n_rr = _run_step(global_step, u, v, w, x, idx, cell, cr_max,
                                              std1, N_in, vol_cell,
                                              ua, va, wa, np_cell, np_cell_max, accumulate=True)
                         f_npt_global.write(f' {global_step * dt} {float(np_count) / float(N0)}\n')
+                        f_rr.write(f' {global_step * dt} {float(n_rr) / N_in}\n')
                         f_npt_p.write(f' {local_step * dt} {float(np_count) / float(N0)}\n')
                         print(f'period= {p}  step= {local_step}  np= {np_count}')
 
@@ -603,10 +627,11 @@ def main():
                 if gap > 0 and p < args.num_periods:
                     for gap_step in range(1, gap + 1):
                         global_step = warmup_end + (p - 1) * stride + args.period + gap_step
-                        np_count = _run_step(global_step, u, v, w, x, idx, cell, cr_max,
+                        np_count, n_rr = _run_step(global_step, u, v, w, x, idx, cell, cr_max,
                                              std1, N_in, vol_cell,
                                              ua, va, wa, np_cell, np_cell_max, accumulate=False)
                         f_npt_global.write(f' {global_step * dt} {float(np_count) / float(N0)}\n')
+                        f_rr.write(f' {global_step * dt} {float(n_rr) / N_in}\n')
                         print(f'period= {p}  gap step= {gap_step}  np= {np_count}')
 
         print(f'Total particle number {N0}')
