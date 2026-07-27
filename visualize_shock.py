@@ -5,7 +5,7 @@ Visualization script for shock_simulation.py output.
 Usage:
     python visualize_shock.py <plot_type> [output_folder]
 
-plot_type : npt | rho | u | T | pdf | all
+plot_type : npt | rho | u | T | flux | pdf | shock_center | all
 output_folder : optional; defaults to the most recently modified shock_output_* folder
 
 In timeseries mode (detected automatically when per-period files are present),
@@ -55,8 +55,13 @@ def load_dat(path):
 
 
 def is_timeseries(outdir):
-    """Return True if the folder contains timeseries (multi-period) output."""
-    return os.path.isfile(os.path.join(outdir, 'rho_1.dat'))
+    """Return True if the folder was produced in timeseries (-t) mode."""
+    run_info = os.path.join(outdir, 'run_info.txt')
+    if not os.path.isfile(run_info):
+        return False
+    with open(run_info) as f:
+        cmd = f.readline().split()
+    return '-t' in cmd
 
 
 def get_period_files(outdir, prefix):
@@ -68,19 +73,38 @@ def get_period_files(outdir, prefix):
     return files
 
 
-def get_gap(outdir):
-    """Return the -gap value used when producing this output folder (0 if not set)."""
+def get_run_param(outdir, name, default=0):
+    """Return an integer CLI argument from run_info.txt, or default if not found."""
     run_info = os.path.join(outdir, 'run_info.txt')
     if not os.path.isfile(run_info):
-        return 0
+        return default
     with open(run_info) as f:
         cmd = f.readline().split()
     for i, tok in enumerate(cmd):
-        if tok.startswith('-gap='):
+        if tok.startswith(f'-{name}='):
             return int(tok.split('=', 1)[1])
-        if tok == '-gap' and i + 1 < len(cmd):
+        if tok == f'-{name}' and i + 1 < len(cmd):
             return int(cmd[i + 1])
-    return 0
+    return default
+
+
+def get_gap(outdir):
+    return get_run_param(outdir, 'gap', 0)
+
+
+def get_L_tube(outdir):
+    """Return L_tube from the printed parameters block in run_info.txt."""
+    run_info = os.path.join(outdir, 'run_info.txt')
+    if not os.path.isfile(run_info):
+        return None
+    with open(run_info) as f:
+        for line in f:
+            if 'L_tube' in line and '=' in line:
+                try:
+                    return float(line.split('=')[1].strip())
+                except ValueError:
+                    pass
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -99,22 +123,27 @@ def plot_npt(outdir):
     rr_path = os.path.join(outdir, 'removed_right.dat')
     if os.path.isfile(rr_path):
         rr_data = load_dat(rr_path)
-        kernel = np.ones(10) / 10
-        # mode='valid' gives N-9 values, each a fully-windowed average;
-        # rr_smooth[k] = mean of steps k..k+9, associated with time rr_data[k+9]
+        warmup  = get_run_param(outdir, 'warmup', 1000)
+        n_per   = get_run_param(outdir, 'num_periods', 1)
+        period  = get_run_param(outdir, 'period', 1000)
+        gap     = get_run_param(outdir, 'gap', 0)
+        w = max(10, int((warmup + n_per * (period + gap) - gap) / 100))
+        kernel = np.ones(w) / w
+        # mode='valid' gives N-(w-1) values, each a fully-windowed average;
+        # rr_smooth[k] = mean of steps k..k+w-1, associated with time rr_data[k+w-1]
         rr_smooth = np.convolve(rr_data[:, 1], kernel, mode='valid')
-        t_smooth = rr_data[9:, 0]          # time of last element in each window
-        rr_smooth = rr_smooth[10:-10]      # drop first and last 10 averages
-        t_smooth  = t_smooth[10:-10]
+        t_smooth = rr_data[w-1:, 0]       # time of last element in each window
+        rr_smooth = rr_smooth[w:-w]        # drop first and last w averages
+        t_smooth  = t_smooth[w:-w]
         # Set both y-axes so that y=1 is centred at the same vertical level
         pad = 1.15  # 15% headroom beyond the max deviation from 1
         dev1 = max(abs(ratio - 1).max(), 1e-6) * pad
-        dev2 = max(abs(rr_smooth - 1).max(), 1e-6) * pad
+        dev2 = max(abs(rr_smooth - 1).max() * pad, 0.1)
         ax.set_ylim(1 - dev1, 1 + dev1)
 
         ax2 = ax.twinx()
         line2, = ax2.plot(t_smooth, rr_smooth, color='tab:orange',
-                          linewidth=1.0, alpha=0.8, label=r'removed / $N_{in}$ (10-step avg)')
+                          linewidth=1.0, alpha=0.8, label=rf'removed / $N_{{in}}$ ({w}-step avg)')
         ax2.set_ylim(1 - dev2, 1 + dev2)
         ax2.set_ylabel(r'removed / $N_{in}$', color='tab:orange')
         ax2.tick_params(axis='y', labelcolor='tab:orange')
@@ -122,21 +151,21 @@ def plot_npt(outdir):
         ax.legend(lines, [l.get_label() for l in lines], fontsize=8)
 
     # In timeseries mode, draw separators at period boundaries
-    period_npt_files = get_period_files(outdir, 'npt')
-    if period_npt_files:
-        num_periods = len(period_npt_files)
-        period_steps = len(load_dat(period_npt_files[0]))
-        gap = get_gap(outdir)
-        stride = period_steps + gap
-        warmup_steps = len(t) - num_periods * period_steps - (num_periods - 1) * gap
-        for p in range(num_periods):
-            start_idx = warmup_steps + p * stride
-            if 0 <= start_idx < len(t):
-                ax.axvline(t[start_idx], color='gray', linewidth=0.7, linestyle='--', alpha=0.7)
-            if gap > 0 and p < num_periods - 1:
-                end_idx = warmup_steps + p * stride + period_steps
-                if 0 <= end_idx < len(t):
-                    ax.axvline(t[end_idx], color='gray', linewidth=0.7, linestyle='--', alpha=0.7)
+    if is_timeseries(outdir):
+        num_periods = get_run_param(outdir, 'num_periods', 0)
+        period_steps = get_run_param(outdir, 'period', 0)
+        if num_periods > 0 and period_steps > 0:
+            gap = get_gap(outdir)
+            stride = period_steps + gap
+            warmup_steps = len(t) - num_periods * period_steps - (num_periods - 1) * gap
+            for p in range(num_periods):
+                start_idx = warmup_steps + p * stride
+                if 0 <= start_idx < len(t):
+                    ax.axvline(t[start_idx], color='gray', linewidth=0.7, linestyle='--', alpha=0.7)
+                if gap > 0 and p < num_periods - 1:
+                    end_idx = warmup_steps + p * stride + period_steps
+                    if 0 <= end_idx < len(t):
+                        ax.axvline(t[end_idx], color='gray', linewidth=0.7, linestyle='--', alpha=0.7)
 
     ax.set_xlabel('Time')
     ax.set_ylabel(r'$N_p \/ / \/ N_0$', color='tab:blue')
@@ -147,20 +176,23 @@ def plot_npt(outdir):
 
 
 def _plot_spatial_timeseries(outdir, prefix, ylabel, title_label):
-    """Overlay all per-period spatial profiles with a viridis colormap."""
-    period_files = get_period_files(outdir, prefix)
-    if not period_files:
-        print(f'No {prefix}_N.dat files found in {Path(outdir).name}')
-        return
+    """Overlay all per-period spatial profiles with a viridis colormap.
 
-    n = len(period_files)
+    Reads the combined <prefix>.dat file (columns: period, x, value).
+    """
+    path = os.path.join(outdir, f'{prefix}.dat')
+    if not os.path.isfile(path):
+        print(f'No {prefix}.dat found in {Path(outdir).name}')
+        return
+    data = load_dat(path)
+    periods = np.unique(data[:, 0].astype(int))
+    n = len(periods)
     colors = cm.viridis(np.linspace(0, 1, n))
 
     _, ax = plt.subplots(figsize=(8, 5))
-
-    for fpath, color in zip(period_files, colors):
-        data = load_dat(fpath)
-        ax.plot(data[:, 0], data[:, 1], color=color, linewidth=1.0)
+    for period, color in zip(periods, colors):
+        mask = data[:, 0].astype(int) == period
+        ax.plot(data[mask, 1], data[mask, 2], color=color, linewidth=1.0)
 
     sm = plt.cm.ScalarMappable(cmap='viridis', norm=plt.Normalize(1, n))
     sm.set_array([])
@@ -209,18 +241,19 @@ def plot_u(outdir):
 
 def plot_flux(outdir):
     if is_timeseries(outdir):
-        rho_files = get_period_files(outdir, 'rho')
-        u_files   = get_period_files(outdir, 'u')
-        if not rho_files:
-            print(f'No rho_N.dat files found in {Path(outdir).name}')
+        rho_path = os.path.join(outdir, 'rho.dat')
+        if not os.path.isfile(rho_path):
+            print(f'No rho.dat found in {Path(outdir).name}')
             return
-        n = len(rho_files)
+        rho_data = load_dat(rho_path)
+        u_data   = load_dat(os.path.join(outdir, 'u.dat'))
+        periods = np.unique(rho_data[:, 0].astype(int))
+        n = len(periods)
         colors = cm.viridis(np.linspace(0, 1, n))
         _, ax = plt.subplots(figsize=(8, 5))
-        for rf, uf, color in zip(rho_files, u_files, colors):
-            rho_data = load_dat(rf)
-            u_data   = load_dat(uf)
-            ax.plot(rho_data[:, 0], rho_data[:, 1] * u_data[:, 1], color=color, linewidth=1.0)
+        for period, color in zip(periods, colors):
+            mask = rho_data[:, 0].astype(int) == period
+            ax.plot(rho_data[mask, 1], rho_data[mask, 2] * u_data[mask, 2], color=color, linewidth=1.0)
         sm = plt.cm.ScalarMappable(cmap='viridis', norm=plt.Normalize(1, n))
         sm.set_array([])
         plt.colorbar(sm, ax=ax, label='period')
@@ -250,6 +283,36 @@ def plot_T(outdir):
     ax.set_xlabel(r'$x \/ / \/ \lambda_1$')
     ax.set_ylabel('T')
     ax.set_title(f'Temperature profile\n{Path(outdir).name}')
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+
+
+def plot_shock_center(outdir):
+    path = os.path.join(outdir, 'shock_center.dat')
+    if not os.path.isfile(path):
+        print(f'No shock_center.dat found in {Path(outdir).name}')
+        return
+    data = load_dat(path)
+    if data.ndim == 1:
+        data = data.reshape(1, -1)
+    t = data[:, 0]
+    raw = data[:, 1].copy()
+
+    error_mask = (raw == -1)
+    if error_mask.any() and not error_mask.all():
+        idx = np.arange(len(raw), dtype=float)
+        raw[error_mask] = np.interp(idx[error_mask], idx[~error_mask], raw[~error_mask])
+
+    L_tube = get_L_tube(outdir)
+    centers = raw / L_tube if L_tube else raw
+
+    _, ax = plt.subplots(figsize=(8, 4))
+    ax.plot(t, centers, color='tab:blue', linewidth=0.8, alpha=0.7)
+    if error_mask.any():
+        ax.plot(t[error_mask], centers[error_mask], 'o', color='red', markersize=0.8, zorder=3)
+    ax.set_xlabel('Time')
+    ax.set_ylabel('Shock center (tube fraction)')
+    ax.set_title(f'Shock center over time\n{Path(outdir).name}')
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
 
@@ -324,12 +387,13 @@ def plot_pdf(outdir):
 # ---------------------------------------------------------------------------
 
 PLOT_FUNCS = {
-    'npt':  plot_npt,
-    'rho':  plot_rho,
-    'u':    plot_u,
-    'T':    plot_T,
-    'flux': plot_flux,
-    'pdf':  plot_pdf,
+    'npt':          plot_npt,
+    'rho':          plot_rho,
+    'u':            plot_u,
+    'T':            plot_T,
+    'flux':         plot_flux,
+    'pdf':          plot_pdf,
+    'shock_center': plot_shock_center,
 }
 
 VALID_TYPES = list(PLOT_FUNCS.keys()) + ['all']
@@ -345,7 +409,7 @@ def main():
     outdir = find_output_dir(folder_arg)
     print(f'Reading from: {Path(outdir).name}')
     if is_timeseries(outdir):
-        n = len(get_period_files(outdir, 'rho'))
+        n = get_run_param(outdir, 'num_periods', 0)
         print(f'Timeseries mode detected: {n} period(s)')
 
     # Derive plots folder from the datetime embedded in the output folder name
