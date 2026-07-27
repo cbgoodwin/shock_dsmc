@@ -9,10 +9,12 @@ import collections
 import math
 import sys
 import os
+import time
 from pathlib import Path
 from datetime import datetime
 import numpy as np
 from scipy.special import erf
+from scipy.optimize import curve_fit
 start_time = datetime.now()
 # ===== Parameters =====
 
@@ -268,15 +270,27 @@ def collision(u, v, w, cell, cell_no, cr_max, vol_cell):
     w[pc] = w_cell
 
 
-def write_spatial_profiles(ua, va, wa, np_cell, outdir, n_sample_steps, suffix=''):
-    """Write rho, u, T spatial profiles to dat files with optional filename suffix."""
+def write_spatial_profiles(ua, va, wa, np_cell, outdir, n_sample_steps, period=None):
+    """Write rho, u, T spatial profiles.
+
+    Single-batch (period=None): write header + 2-column (x, value) to rho/u/T.dat.
+    Timeseries (period=int): prepend a period column; open in write mode for period 1,
+    append mode for subsequent periods so all periods land in one file.
+    """
     rho0 = float(N0) / (float(ncell) * (2.0 / 3.0) * rho1 + float(ncell) * (1.0 / 3.0) * rho2)
-    with open(os.path.join(outdir, f'rho{suffix}.dat'), 'w') as f200, \
-         open(os.path.join(outdir, f'u{suffix}.dat'), 'w') as f201, \
-         open(os.path.join(outdir, f'T{suffix}.dat'), 'w') as f202:
-        f200.write('variables="x/<greek>l</greek><sub>1","<greek>r</greek>"\n')
-        f201.write('variables="x/<greek>l</greek><sub>1","u"\n')
-        f202.write('variables="x/<greek>l</greek><sub>1","T"\n')
+    mode = 'a' if (period is not None and period > 1) else 'w'
+    with open(os.path.join(outdir, 'rho.dat'), mode) as f200, \
+         open(os.path.join(outdir, 'u.dat'), mode) as f201, \
+         open(os.path.join(outdir, 'T.dat'), mode) as f202:
+        if mode == 'w':
+            if period is None:
+                f200.write('variables="x/<greek>l</greek><sub>1","<greek>r</greek>"\n')
+                f201.write('variables="x/<greek>l</greek><sub>1","u"\n')
+                f202.write('variables="x/<greek>l</greek><sub>1","T"\n')
+            else:
+                f200.write('variables="period","x/<greek>l</greek><sub>1","<greek>r</greek>"\n')
+                f201.write('variables="period","x/<greek>l</greek><sub>1","u"\n')
+                f202.write('variables="period","x/<greek>l</greek><sub>1","T"\n')
         for i in range(ncell):
             xx = float(i) * dx / lamda1
             rho = float(np_cell[i]) / rho0 / float(n_sample_steps)
@@ -286,9 +300,14 @@ def write_spatial_profiles(ua, va, wa, np_cell, outdir, n_sample_steps, suffix='
             else:
                 uu = 0.0
                 Tp = 0.0
-            f200.write(f' {xx} {rho}\n')
-            f201.write(f' {xx} {uu}\n')
-            f202.write(f' {xx} {Tp}\n')
+            if period is None:
+                f200.write(f' {xx} {rho}\n')
+                f201.write(f' {xx} {uu}\n')
+                f202.write(f' {xx} {Tp}\n')
+            else:
+                f200.write(f' {period} {xx} {rho}\n')
+                f201.write(f' {period} {xx} {uu}\n')
+                f202.write(f' {period} {xx} {Tp}\n')
 
 
 def get_pdf_cell(ua, va, wa, np_cell, ipdf, outdir, n_sample_steps):
@@ -367,6 +386,38 @@ def get_pdf_cell(ua, va, wa, np_cell, ipdf, outdir, n_sample_steps):
                 f101.write(f' {x} {pdf_u[i+half]} {pdf_v[i+half]} {pdf_w[i+half]}'
                            f' {pdf_ue1} {pdf_ue2} {pdf_ve1} {pdf_ve2}\n')
 
+sigmoid = lambda x, rho, slope, center : rho/(1+np.exp(-4*slope*(x-center)))
+
+def get_shock_center(np_cell_avg, verbose=False):
+    rho_denom = float(N0) / (float(ncell) * (2.0 / 3.0) * rho1 + float(ncell) * (1.0 / 3.0) * rho2)
+    rho_cell_adj = np_cell_avg/rho_denom - 1         # normalize so that rho_adj ~ 0 upstream
+    cell_centers = L_tube*np.linspace(1/ncell, 1-1/ncell, ncell)
+
+    # initial guess to aid convergence in the next step
+    rho_est = np.mean(rho_cell_adj[-5:])
+    middle = np.where((rho_cell_adj > 0.33*rho_est) & (rho_cell_adj < 0.67*rho_est))[0]
+    x_0, x_1 = middle[0], middle[-1]
+    slope_est = (rho_cell_adj[x_1]-rho_cell_adj[x_0])/(cell_centers[x_1]-cell_centers[x_0])
+    center_est = np.mean(cell_centers[middle])
+    scaling_factor = np.sqrt(center_est/slope_est)
+    estimates = [rho_est, slope_est, center_est]
+    scaled_estimates = [rho_est, slope_est*scaling_factor, center_est/scaling_factor]
+
+    # fit curve using gauss-newton
+    try:
+
+        scaled_fit = curve_fit(sigmoid, cell_centers[3:]/scaling_factor, rho_cell_adj[3:], p0=scaled_estimates)[0]
+        fit = [scaled_fit[0], scaled_fit[1]/scaling_factor, scaled_fit[2]*scaling_factor]
+        center = fit[2]
+        if verbose:
+            print(f'  estimates: rho={estimates[0]:.3f}  slope={estimates[1]:.3f}  center={estimates[2]:.3f}')
+            print(f'  fit:       rho={fit[0]:.3f}  slope={fit[1]:.3f}  center={fit[2]:.3f}')
+    except:
+        center = -1
+        
+    return center
+
+_timers = {'collision': 0.0, 'shock_center': 0.0, 'file_io': 0.0}
 
 # ===== Main Program =====
 
@@ -418,8 +469,10 @@ def _run_step(i, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell,
     raw_cells = (x[still_active] / L_tube * float(ncell)).astype(int)
     cell[still_active] = np.clip(raw_cells, 0, ncell - 1)
 
+    _t0 = time.perf_counter()
     for k in range(ncell):                # do collisions cell by cell
         collision(u, v, w, cell, k, cr_max, vol_cell)
+    _timers['collision'] += time.perf_counter() - _t0
 
     if accumulate:                        # true if period is active, i.e. not in warmup or gap
         acc_idx = np.where(idx == 1)[0]
@@ -514,13 +567,17 @@ def main():
             cell[j] = min(ncell - 1, int((x[j] / L_tube) * float(ncell)))
 
     np_count = 0
+    warmup_print_stride = max(10, args.warmup // 100)
+    period_print_stride = max(10, args.period // 10) if args.period else 10
 
     if args.s:
         # ----- Single batch mode -----
         with open(os.path.join(outdir, 'npt.dat'), 'w') as f10, \
-             open(os.path.join(outdir, 'removed_right.dat'), 'w') as f_rr:
+             open(os.path.join(outdir, 'removed_right.dat'), 'w') as f_rr, \
+             open(os.path.join(outdir, 'shock_center.dat'), 'w') as f_sc:
             f10.write('variables="t","Number of particles in the tube"\n')
             f_rr.write('variables="t","removed/N_in"\n')
+            f_sc.write('variables="t","center"\n')
 
             if args.initialize_empty:
                 # Dynamic warmup: run until np_count falls below the count from 10 steps prior
@@ -530,9 +587,12 @@ def main():
                     i += 1
                     np_count, n_rr = _run_step(i, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell,
                                          ua, va, wa, np_cell, np_cell_max, accumulate=False)
+                    _t0 = time.perf_counter()
                     f10.write(f' {i * dt} {float(np_count) / float(N0)}\n')
                     f_rr.write(f' {i * dt} {float(n_rr) / N_in}\n')
-                    print(f'warmup step= {i}  np= {np_count}')
+                    _timers['file_io'] += time.perf_counter() - _t0
+                    if (i - 1) % warmup_print_stride == 0:
+                        print(f'warmup step= {i}  np= {np_count}')
                     history.append(np_count)
                     if len(history) == 10 and np_count < history[0]:
                         break
@@ -542,17 +602,35 @@ def main():
                     i += 1
                     np_count, n_rr = _run_step(i, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell,
                                          ua, va, wa, np_cell, np_cell_max, accumulate=True)
+                    _t0 = time.perf_counter()
                     f10.write(f' {i * dt} {float(np_count) / float(N0)}\n')
                     f_rr.write(f' {i * dt} {float(n_rr) / N_in}\n')
+                    _timers['file_io'] += time.perf_counter() - _t0
+                    _t0 = time.perf_counter()
+                    center = get_shock_center(np.bincount(cell[idx == 1], minlength=ncell).astype(float))
+                    _timers['shock_center'] += time.perf_counter() - _t0
+                    _t0 = time.perf_counter()
+                    f_sc.write(f' {i * dt} {center}\n')
+                    _timers['file_io'] += time.perf_counter() - _t0
                     print(f'step= {i}  np= {np_count}')
             else:
                 for i in range(1, Nt_end + 1):
                     accumulate = (Nt_start <= i <= Nt_end)
                     np_count, n_rr = _run_step(i, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell,
                                          ua, va, wa, np_cell, np_cell_max, accumulate)
+                    _t0 = time.perf_counter()
                     f10.write(f' {i * dt} {float(np_count) / float(N0)}\n')
                     f_rr.write(f' {i * dt} {float(n_rr) / N_in}\n')
-                    print(f'step= {i}  np= {np_count}')
+                    _timers['file_io'] += time.perf_counter() - _t0
+                    if accumulate:
+                        _t0 = time.perf_counter()
+                        center = get_shock_center(np.bincount(cell[idx == 1], minlength=ncell).astype(float))
+                        _timers['shock_center'] += time.perf_counter() - _t0
+                        _t0 = time.perf_counter()
+                        f_sc.write(f' {i * dt} {center}\n')
+                        _timers['file_io'] += time.perf_counter() - _t0
+                    if accumulate or (i - 1) % warmup_print_stride == 0:
+                        print(f'step= {i}  np= {np_count}')
                 print(f'Warmup complete: {args.warmup} steps')
 
         print(np_cell / float(n_sample_steps))
@@ -560,7 +638,9 @@ def main():
         print(f'Np for cell statistics= {np_cell}')
         print(f'Total particle number {N0}')
 
+        _t0 = time.perf_counter()
         write_spatial_profiles(ua, va, wa, np_cell, outdir, n_sample_steps)
+        _timers['file_io'] += time.perf_counter() - _t0
         for i in range(-30, 27, 2):
             cell_idx = 123 + i  # centred on shock position at 2*L_tube/3
             if 0 <= cell_idx < ncell:
@@ -569,9 +649,11 @@ def main():
     else:
         # ----- Timeseries mode -----
         with open(os.path.join(outdir, 'npt.dat'), 'w') as f_npt_global, \
-             open(os.path.join(outdir, 'removed_right.dat'), 'w') as f_rr:
+             open(os.path.join(outdir, 'removed_right.dat'), 'w') as f_rr, \
+             open(os.path.join(outdir, 'shock_center.dat'), 'w') as f_sc:
             f_npt_global.write('variables="t","Number of particles in the tube"\n')
             f_rr.write('variables="t","removed/N_in"\n')
+            f_sc.write('variables="t","center"\n')
 
             # Warmup phase
             if args.initialize_empty:
@@ -582,9 +664,12 @@ def main():
                     warmup_end += 1
                     np_count, n_rr = _run_step(warmup_end, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell,
                                          ua, va, wa, np_cell, np_cell_max, accumulate=False)
+                    _t0 = time.perf_counter()
                     f_npt_global.write(f' {warmup_end * dt} {float(np_count) / float(N0)}\n')
                     f_rr.write(f' {warmup_end * dt} {float(n_rr) / N_in}\n')
-                    print(f'warmup step= {warmup_end}  np= {np_count}')
+                    _timers['file_io'] += time.perf_counter() - _t0
+                    if (warmup_end - 1) % warmup_print_stride == 0:
+                        print(f'warmup step= {warmup_end}  np= {np_count}')
                     history.append(np_count)
                     if len(history) == 10 and np_count < history[0]:
                         break
@@ -593,9 +678,12 @@ def main():
                 for warmup_end in range(1, args.warmup + 1):
                     np_count, n_rr = _run_step(warmup_end, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell,
                                          ua, va, wa, np_cell, np_cell_max, accumulate=False)
+                    _t0 = time.perf_counter()
                     f_npt_global.write(f' {warmup_end * dt} {float(np_count) / float(N0)}\n')
                     f_rr.write(f' {warmup_end * dt} {float(n_rr) / N_in}\n')
-                    print(f'warmup step= {warmup_end}  np= {np_count}')
+                    _timers['file_io'] += time.perf_counter() - _t0
+                    if (warmup_end - 1) % warmup_print_stride == 0:
+                        print(f'warmup step= {warmup_end}  np= {np_count}')
                 print(f'Warmup complete: {args.warmup} steps')
 
             # Timeseries phase: one output set per period, with optional gaps between periods
@@ -607,37 +695,62 @@ def main():
                 wa[:] = 0.0
                 np_cell[:] = 0
 
-                with open(os.path.join(outdir, f'npt_{p}.dat'), 'w') as f_npt_p:
-                    f_npt_p.write('variables="t","Number of particles in the tube"\n')
-
-                    for local_step in range(1, args.period + 1):
-                        global_step = warmup_end + (p - 1) * stride + local_step
-                        np_count, n_rr = _run_step(global_step, u, v, w, x, idx, cell, cr_max,
-                                             std1, N_in, vol_cell,
-                                             ua, va, wa, np_cell, np_cell_max, accumulate=True)
-                        f_npt_global.write(f' {global_step * dt} {float(np_count) / float(N0)}\n')
-                        f_rr.write(f' {global_step * dt} {float(n_rr) / N_in}\n')
-                        f_npt_p.write(f' {local_step * dt} {float(np_count) / float(N0)}\n')
+                for local_step in range(1, args.period + 1):
+                    global_step = warmup_end + (p - 1) * stride + local_step
+                    np_count, n_rr = _run_step(global_step, u, v, w, x, idx, cell, cr_max,
+                                         std1, N_in, vol_cell,
+                                         ua, va, wa, np_cell, np_cell_max, accumulate=True)
+                    _t0 = time.perf_counter()
+                    f_npt_global.write(f' {global_step * dt} {float(np_count) / float(N0)}\n')
+                    f_rr.write(f' {global_step * dt} {float(n_rr) / N_in}\n')
+                    _timers['file_io'] += time.perf_counter() - _t0
+                    _t0 = time.perf_counter()
+                    center = get_shock_center(np.bincount(cell[idx == 1], minlength=ncell).astype(float),
+                                             verbose=(local_step == 1))
+                    _timers['shock_center'] += time.perf_counter() - _t0
+                    _t0 = time.perf_counter()
+                    f_sc.write(f' {global_step * dt} {center}\n')
+                    _timers['file_io'] += time.perf_counter() - _t0
+                    if (local_step - 1) % period_print_stride == 0:
                         print(f'period= {p}  step= {local_step}  np= {np_count}')
 
-                write_spatial_profiles(ua, va, wa, np_cell, outdir, n_sample_steps, suffix=f'_{p}')
+                _t0 = time.perf_counter()
+                write_spatial_profiles(ua, va, wa, np_cell, outdir, n_sample_steps, period=p)
+                _timers['file_io'] += time.perf_counter() - _t0
                 print(f'period= {p}  particle number ratio (Np/N0) {float(np_count) / float(N0)}')
 
                 # Gap phase: run between periods (skip after the last period)
                 if gap > 0 and p < args.num_periods:
+                    gap_print_stride = max(10, gap // 100)
                     for gap_step in range(1, gap + 1):
                         global_step = warmup_end + (p - 1) * stride + args.period + gap_step
                         np_count, n_rr = _run_step(global_step, u, v, w, x, idx, cell, cr_max,
                                              std1, N_in, vol_cell,
                                              ua, va, wa, np_cell, np_cell_max, accumulate=False)
+                        _t0 = time.perf_counter()
                         f_npt_global.write(f' {global_step * dt} {float(np_count) / float(N0)}\n')
                         f_rr.write(f' {global_step * dt} {float(n_rr) / N_in}\n')
-                        print(f'period= {p}  gap step= {gap_step}  np= {np_count}')
+                        _timers['file_io'] += time.perf_counter() - _t0
+                        _t0 = time.perf_counter()
+                        center = get_shock_center(np.bincount(cell[idx == 1], minlength=ncell).astype(float))
+                        _timers['shock_center'] += time.perf_counter() - _t0
+                        _t0 = time.perf_counter()
+                        f_sc.write(f' {global_step * dt} {center}\n')
+                        _timers['file_io'] += time.perf_counter() - _t0
+                        if (gap_step - 1) % gap_print_stride == 0:
+                            print(f'period= {p}  gap step= {gap_step}  np= {np_count}')
 
         print(f'Total particle number {N0}')
 
     end_time = datetime.now()
+    total_s = (end_time - start_time).total_seconds()
     print('Elapsed time:', end_time - start_time)
+    print('\nTiming breakdown:')
+    for cat, secs in _timers.items():
+        pct = 100.0 * secs / total_s if total_s > 0 else 0.0
+        print(f'  {cat:20s}: {secs:8.3f}s  ({pct:.1f}%)')
+    other_s = total_s - sum(_timers.values())
+    print(f'  {"other":20s}: {other_s:8.3f}s  ({100.0 * other_s / total_s:.1f}%)')
     tee.close()
 
 
