@@ -252,8 +252,9 @@ def plot_flux(outdir):
         colors = cm.viridis(np.linspace(0, 1, n))
         _, ax = plt.subplots(figsize=(8, 5))
         for period, color in zip(periods, colors):
-            mask = rho_data[:, 0].astype(int) == period
-            ax.plot(rho_data[mask, 1], rho_data[mask, 2] * u_data[mask, 2], color=color, linewidth=1.0)
+            rows = np.where(rho_data[:, 0].astype(int) == period)[0]
+            rows = rows[len(rows) // 10:]
+            ax.plot(rho_data[rows, 1], rho_data[rows, 2] * u_data[rows, 2], color=color, linewidth=1.0)
         sm = plt.cm.ScalarMappable(cmap='viridis', norm=plt.Normalize(1, n))
         sm.set_array([])
         plt.colorbar(sm, ax=ax, label='period')
@@ -262,7 +263,8 @@ def plot_flux(outdir):
         rho_data = load_dat(os.path.join(outdir, 'rho.dat'))
         u_data   = load_dat(os.path.join(outdir, 'u.dat'))
         _, ax = plt.subplots(figsize=(7, 4))
-        ax.plot(rho_data[:, 0], rho_data[:, 1] * u_data[:, 1], linewidth=1.2)
+        skip = len(rho_data) // 10
+        ax.plot(rho_data[skip:, 0], rho_data[skip:, 1] * u_data[skip:, 1], linewidth=1.2)
         ax.set_title(f'Mass flux profile\n{Path(outdir).name}')
     ax.set_xlabel(r'$x \/ / \/ \lambda_1$')
     ax.set_ylabel(r'$\rho u$')
