@@ -111,13 +111,20 @@ def parse_args():
                         help='Number of time steps per sampling window (positive integer)')
     parser.add_argument('-num_periods', type=int, default=None,
                         help='Number of periods (required with -t)')
-    parser.add_argument('-initialize_empty', action='store_true',
-                        help='Start with an empty tube; particles enter only via inflow')
+    parser.add_argument('-initialize', type=str, default=None,
+                        help='"empty" to start with an empty tube, or MMDDYY_hhmmss to '
+                             'load particle state from that output folder')
+    parser.add_argument('-piston_speed', type=float, default=1.0,
+                        help='Piston speed multiplier applied to U2 at the right boundary (default: 1.0, must be > 0)')
     parser.add_argument('-gap', type=int, default=0,
                         help='Steps between periods in timeseries mode (positive integer, -t only)')
-    parser.add_argument('-warmup', type=int, default=1000,
-                        help='Number of warmup timesteps before sampling/periods (default: 1000)')
+    parser.add_argument('-warmup', type=int, default=None,
+                        help='Number of warmup timesteps before sampling/periods '
+                             '(default: 0 when loading a state, 1000 otherwise)')
     args = parser.parse_args()
+
+    if args.warmup is None:
+        args.warmup = 0 if (args.initialize not in (None, 'empty')) else 1000
 
     if args.t:
         if args.period is None or args.num_periods is None:
@@ -128,6 +135,8 @@ def parse_args():
             parser.error('-num_periods must be a positive integer')
     if args.period is not None and args.period <= 0:
         parser.error('-period must be a positive integer')
+    if args.piston_speed <= 0:
+        parser.error('-piston_speed must be greater than zero')
     if args.gap != 0:
         if args.s:
             parser.error('-gap can only be used in timeseries mode (-t)')
@@ -389,23 +398,22 @@ def get_pdf_cell(ua, va, wa, np_cell, ipdf, outdir, n_sample_steps):
 sigmoid = lambda x, rho, slope, center : rho/(1+np.exp(-4*slope*(x-center)))
 
 def get_shock_center(np_cell_avg, verbose=False):
-    rho_denom = float(N0) / (float(ncell) * (2.0 / 3.0) * rho1 + float(ncell) * (1.0 / 3.0) * rho2)
-    rho_cell_adj = np_cell_avg/rho_denom - 1         # normalize so that rho_adj ~ 0 upstream
-    cell_centers = L_tube*np.linspace(1/ncell, 1-1/ncell, ncell)
-
-    # initial guess to aid convergence in the next step
-    rho_est = np.mean(rho_cell_adj[-5:])
-    middle = np.where((rho_cell_adj > 0.33*rho_est) & (rho_cell_adj < 0.67*rho_est))[0]
-    x_0, x_1 = middle[0], middle[-1]
-    slope_est = (rho_cell_adj[x_1]-rho_cell_adj[x_0])/(cell_centers[x_1]-cell_centers[x_0])
-    center_est = np.mean(cell_centers[middle])
-    scaling_factor = np.sqrt(center_est/slope_est)
-    estimates = [rho_est, slope_est, center_est]
-    scaled_estimates = [rho_est, slope_est*scaling_factor, center_est/scaling_factor]
-
-    # fit curve using gauss-newton
     try:
+        rho_denom = float(N0) / (float(ncell) * (2.0 / 3.0) * rho1 + float(ncell) * (1.0 / 3.0) * rho2)
+        rho_cell_adj = np_cell_avg/rho_denom - 1         # normalize so that rho_adj ~ 0 upstream
+        cell_centers = L_tube*np.linspace(1/ncell, 1-1/ncell, ncell)
 
+        # initial guess to aid convergence in the next step
+        rho_est = np.mean(rho_cell_adj[-5:])
+        middle = np.where((rho_cell_adj > 0.33*rho_est) & (rho_cell_adj < 0.67*rho_est))[0]
+        x_0, x_1 = middle[0], middle[-1]
+        slope_est = (rho_cell_adj[x_1]-rho_cell_adj[x_0])/(cell_centers[x_1]-cell_centers[x_0])
+        center_est = np.mean(cell_centers[middle])
+        scaling_factor = np.sqrt(center_est/slope_est)
+        estimates = [rho_est, slope_est, center_est]
+        scaled_estimates = [rho_est, slope_est*scaling_factor, center_est/scaling_factor]
+
+        # fit curve using gauss-newton
         scaled_fit = curve_fit(sigmoid, cell_centers[3:]/scaling_factor, rho_cell_adj[3:], p0=scaled_estimates)[0]
         fit = [scaled_fit[0], scaled_fit[1]/scaling_factor, scaled_fit[2]*scaling_factor]
         center = fit[2]
@@ -421,7 +429,7 @@ _timers = {'collision': 0.0, 'shock_center': 0.0, 'file_io': 0.0}
 
 # ===== Main Program =====
 
-def _run_step(i, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell,
+def _run_step(i, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell, piston_speed,
               ua, va, wa, np_cell, np_cell_max, accumulate):
     """Execute one time step: inject, move, collide, optionally accumulate samples.
     Returns (np_count, n_removed_right)."""
@@ -450,8 +458,11 @@ def _run_step(i, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell,
     #t_c = (L_tube - x0[right]) / u_old_right
     #x[right] = L_tube + u[right] * (dt - t_c)
 
+    # set piston speed
+    Uw = U2*piston_speed
+    
     # collide with right boundary, Fortran code method (uncomment next two lines)
-    u[right] = 2.0 * U2 - u[right]        # update the velocities
+    u[right] = 2.0 * Uw - u[right]        # update the velocities
     x[right] = 2.0 * L_tube - x0[right] + u[right] * dt
 
     still_right = right & (x >= L_tube)   # remove at right boundary
@@ -548,7 +559,7 @@ def main():
     # Initialize particles
     std1 = 1.0 / (math.sqrt(2.0) * beta1) # upstream
     std2 = 1.0 / (math.sqrt(2.0) * beta2) # downstream
-    if not args.initialize_empty:
+    if args.initialize is None:
         prob = 2.0 * rho1 / (2.0 * rho1 + rho2)    # probability the particle is upstream (shock at 2/3)
         for j in range(N0):
             R1 = np.random.random()
@@ -565,7 +576,27 @@ def main():
                 w[j] = gasdev(0.0, std2)
             idx[j] = 1
             cell[j] = min(ncell - 1, int((x[j] / L_tube) * float(ncell)))
+    elif args.initialize != 'empty':
+        candidates = [
+            Path(args.initialize) / 'state.dat',
+            script_dir / args.initialize / 'state.dat',
+            output_root / f'shock_output_{args.initialize}' / 'state.dat',
+        ]
+        state_path = next((p for p in candidates if p.is_file()), None)
+        if state_path is None:
+            sys.exit('Error: state.dat not found. Tried:\n' +
+                     '\n'.join(f'  {p}' for p in candidates))
+        state_data = np.loadtxt(str(state_path), skiprows=1)
+        if state_data.ndim == 1:
+            state_data = state_data.reshape(1, -1)
+        for j, (xj, uj, vj, wj) in enumerate(state_data[:Nmax]):
+            x[j], u[j], v[j], w[j] = xj, uj, vj, wj
+            idx[j] = 1
+            cell[j] = min(ncell - 1, int(xj / L_tube * float(ncell)))
+        print(f'Initialized from state: {args.initialize} ({min(len(state_data), Nmax)} particles)')
+    # else: args.initialize == 'empty' -> tube starts empty (arrays already zeroed)
 
+    piston_speed = args.piston_speed
     np_count = 0
     warmup_print_stride = max(10, args.warmup // 100)
     period_print_stride = max(10, args.period // 10) if args.period else 10
@@ -579,13 +610,13 @@ def main():
             f_rr.write('variables="t","removed/N_in"\n')
             f_sc.write('variables="t","center"\n')
 
-            if args.initialize_empty:
+            if args.initialize == 'empty':
                 # Dynamic warmup: run until np_count falls below the count from 10 steps prior
                 history = collections.deque(maxlen=10)
                 i = 0
                 while True:
                     i += 1
-                    np_count, n_rr = _run_step(i, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell,
+                    np_count, n_rr = _run_step(i, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell, piston_speed,
                                          ua, va, wa, np_cell, np_cell_max, accumulate=False)
                     _t0 = time.perf_counter()
                     f10.write(f' {i * dt} {float(np_count) / float(N0)}\n')
@@ -600,7 +631,7 @@ def main():
                 # Sampling phase
                 for _ in range(n_sample_steps):
                     i += 1
-                    np_count, n_rr = _run_step(i, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell,
+                    np_count, n_rr = _run_step(i, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell, piston_speed,
                                          ua, va, wa, np_cell, np_cell_max, accumulate=True)
                     _t0 = time.perf_counter()
                     f10.write(f' {i * dt} {float(np_count) / float(N0)}\n')
@@ -616,7 +647,7 @@ def main():
             else:
                 for i in range(1, Nt_end + 1):
                     accumulate = (Nt_start <= i <= Nt_end)
-                    np_count, n_rr = _run_step(i, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell,
+                    np_count, n_rr = _run_step(i, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell, piston_speed,
                                          ua, va, wa, np_cell, np_cell_max, accumulate)
                     _t0 = time.perf_counter()
                     f10.write(f' {i * dt} {float(np_count) / float(N0)}\n')
@@ -656,13 +687,14 @@ def main():
             f_sc.write('variables="t","center"\n')
 
             # Warmup phase
-            if args.initialize_empty:
+            warmup_end = 0
+            if args.initialize == 'empty':
                 # Dynamic warmup: run until np_count falls below the count from 10 steps prior
                 history = collections.deque(maxlen=10)
                 warmup_end = 0
                 while True:
                     warmup_end += 1
-                    np_count, n_rr = _run_step(warmup_end, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell,
+                    np_count, n_rr = _run_step(warmup_end, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell, piston_speed,
                                          ua, va, wa, np_cell, np_cell_max, accumulate=False)
                     _t0 = time.perf_counter()
                     f_npt_global.write(f' {warmup_end * dt} {float(np_count) / float(N0)}\n')
@@ -676,7 +708,7 @@ def main():
                 print(f'Warmup complete: {warmup_end} steps (dynamic)')
             else:
                 for warmup_end in range(1, args.warmup + 1):
-                    np_count, n_rr = _run_step(warmup_end, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell,
+                    np_count, n_rr = _run_step(warmup_end, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell, piston_speed,
                                          ua, va, wa, np_cell, np_cell_max, accumulate=False)
                     _t0 = time.perf_counter()
                     f_npt_global.write(f' {warmup_end * dt} {float(np_count) / float(N0)}\n')
@@ -698,7 +730,7 @@ def main():
                 for local_step in range(1, args.period + 1):
                     global_step = warmup_end + (p - 1) * stride + local_step
                     np_count, n_rr = _run_step(global_step, u, v, w, x, idx, cell, cr_max,
-                                         std1, N_in, vol_cell,
+                                         std1, N_in, vol_cell, piston_speed,
                                          ua, va, wa, np_cell, np_cell_max, accumulate=True)
                     _t0 = time.perf_counter()
                     f_npt_global.write(f' {global_step * dt} {float(np_count) / float(N0)}\n')
@@ -725,7 +757,7 @@ def main():
                     for gap_step in range(1, gap + 1):
                         global_step = warmup_end + (p - 1) * stride + args.period + gap_step
                         np_count, n_rr = _run_step(global_step, u, v, w, x, idx, cell, cr_max,
-                                             std1, N_in, vol_cell,
+                                             std1, N_in, vol_cell, piston_speed,
                                              ua, va, wa, np_cell, np_cell_max, accumulate=False)
                         _t0 = time.perf_counter()
                         f_npt_global.write(f' {global_step * dt} {float(np_count) / float(N0)}\n')
@@ -741,6 +773,14 @@ def main():
                             print(f'period= {p}  gap step= {gap_step}  np= {np_count}')
 
         print(f'Total particle number {N0}')
+
+    _t0 = time.perf_counter()
+    active = idx == 1
+    with open(os.path.join(outdir, 'state.dat'), 'w') as f_state:
+        f_state.write('variables="x","u","v","w"\n')
+        np.savetxt(f_state, np.column_stack([x[active], u[active], v[active], w[active]]),
+                   fmt=' %.15g')
+    _timers['file_io'] += time.perf_counter() - _t0
 
     end_time = datetime.now()
     total_s = (end_time - start_time).total_seconds()
