@@ -116,6 +116,8 @@ def parse_args():
                              'load particle state from that output folder')
     parser.add_argument('-piston_speed', type=float, default=1.0,
                         help='Piston speed multiplier applied to U2 at the right boundary (default: 1.0, must be > 0)')
+    parser.add_argument('-smooth_center', type=int, default=3,
+                        help='Number of timesteps in the trailing average used for shock center computation (default: 3, must be > 0)')
     parser.add_argument('-gap', type=int, default=0,
                         help='Steps between periods in timeseries mode (positive integer, -t only)')
     parser.add_argument('-warmup', type=int, default=None,
@@ -137,6 +139,8 @@ def parse_args():
         parser.error('-period must be a positive integer')
     if args.piston_speed <= 0:
         parser.error('-piston_speed must be greater than zero')
+    if args.smooth_center <= 0:
+        parser.error('-smooth_center must be a positive integer')
     if args.gap != 0:
         if args.s:
             parser.error('-gap can only be used in timeseries mode (-t)')
@@ -721,6 +725,9 @@ def main():
             # Timeseries phase: one output set per period, with optional gaps between periods
             gap = args.gap
             stride = args.period + gap  # steps consumed per period slot
+            # Trailing buffer for 3-step average passed to get_shock_center
+            _init_count = np.bincount(cell[idx == 1], minlength=ncell).astype(float)
+            np_cell_buf = collections.deque([_init_count] * args.smooth_center, maxlen=args.smooth_center)
             for p in range(1, args.num_periods + 1):
                 ua[:] = 0.0
                 va[:] = 0.0
@@ -737,7 +744,8 @@ def main():
                     f_rr.write(f' {global_step * dt} {float(n_rr) / N_in}\n')
                     _timers['file_io'] += time.perf_counter() - _t0
                     _t0 = time.perf_counter()
-                    center = get_shock_center(np.bincount(cell[idx == 1], minlength=ncell).astype(float),
+                    np_cell_buf.append(np.bincount(cell[idx == 1], minlength=ncell).astype(float))
+                    center = get_shock_center(sum(np_cell_buf) / len(np_cell_buf),
                                              verbose=(local_step == 1))
                     _timers['shock_center'] += time.perf_counter() - _t0
                     _t0 = time.perf_counter()
