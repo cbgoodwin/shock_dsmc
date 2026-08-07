@@ -483,25 +483,36 @@ def _run_step(i, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell, Uw,
     Returns (np_count, n_removed_right)."""
     p_in = int(N_in + 0.5)
 
-    # ---- Vectorized injection: batch-sample u_ini/v/w in one call each ----
-    inactive_slots = np.where(idx == 0)[0]
+    # Pre-injection active mask: used for the full-step move and boundary checks.
+    # Injected particles are placed directly at their end-of-step position, so
+    # they skip the move.
+    active_slots = (idx == 1)
+
+    # ---- Vectorized injection: batch-sample u_ini/v/w in one call each.
+    # Injected particles are placed at x = u*dt*r (r ~ U[0,1]) so they are
+    # uniformly distributed in [0, u*dt] at the end of the step, matching a
+    # uniformly-distributed entry time within [0, dt]. ----
+    inactive_slots = np.where(~active_slots)[0]
     to_inject = min(p_in, len(inactive_slots))
+    injection_slots = inactive_slots[:to_inject] if to_inject > 0 else None
     if to_inject > 0:
-        slots = inactive_slots[:to_inject]
-        u[slots] = _sample_u_ini_batch(beta1, U1, to_inject)
-        v[slots] = np.random.normal(0.0, std1, size=to_inject)
-        w[slots] = np.random.normal(0.0, std1, size=to_inject)
-        idx[slots] = 1
-        x[slots] = 0.0
+        u[injection_slots] = _sample_u_ini_batch(beta1, U1, to_inject)
+        v[injection_slots] = np.random.normal(0.0, std1, size=to_inject)
+        w[injection_slots] = np.random.normal(0.0, std1, size=to_inject)
+        idx[injection_slots] = 1
+        x[injection_slots] = u[injection_slots] * dt * np.random.random(size=to_inject)
 
-    active = (idx == 1)
-    np_count = int(np.sum(active))
+    # ---- Detect right-crossers among pre-existing actives BEFORE moving
+    # (injected particles cannot cross L_tube in one partial step). ----
+    right = active_slots & (x + u * dt >= L_tube)
 
-    # ---- Detect right-crossers BEFORE moving to avoid a full x0 = x.copy() ----
-    right = active & (x + u * dt >= L_tube)
+    # ---- Move pre-existing active particles by full u*dt ----
+    x[active_slots] += u[active_slots] * dt
 
-    # ---- Move all active particles ----
-    x[active] += u[active] * dt
+    # Fold newly-injected particles into active_slots for downstream ops
+    if to_inject > 0:
+        active_slots[injection_slots] = True
+    np_count = int(np.sum(active_slots))
 
     # ---- Reflect right-crossers off the piston (Fortran-code method) ----
     if right.any():
@@ -516,25 +527,25 @@ def _run_step(i, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell, Uw,
             idx[still_right] = 0
             cell[still_right] = -1
             np_count -= n_removed_right
-            active &= ~still_right                # keep `active` in sync w/o recomputing (idx == 1)
+            active_slots &= ~still_right                # keep `active` in sync w/o recomputing (idx == 1)
     else:
         n_removed_right = 0
 
     # ---- Left-boundary removal (reflected particles land near L_tube, so ~right is redundant) ----
-    left = active & (x < 0.0)
+    left = active_slots & (x < 0.0)
     if left.any():
         n_left = int(np.sum(left))
         idx[left] = 0
         cell[left] = -1
         np_count -= n_left
-        active &= ~left
+        active_slots &= ~left
 
     # ---- Cell assignment (active now equals still_active) ----
-    raw_cells = (x[active] / L_tube * float(ncell)).astype(int)
-    cell[active] = np.clip(raw_cells, 0, ncell - 1)
+    raw_cells = (x[active_slots] / L_tube * float(ncell)).astype(int)
+    cell[active_slots] = np.clip(raw_cells, 0, ncell - 1)
 
     # ---- Build sorted cell index once — O(N log N) vs O(N * ncell) per-cell search ----
-    active_indices = np.where(active)[0]
+    active_indices = np.where(active_slots)[0]
     _sort_order  = np.argsort(cell[active_indices], kind='stable')
     sorted_pix   = active_indices[_sort_order]       # particle indices sorted by cell
     cells_sorted = cell[sorted_pix]                  # cell id of each sorted particle
