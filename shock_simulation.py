@@ -196,6 +196,40 @@ def u_ini(beta, u_bulk):
             return u_candidate
 
 
+def _sample_u_ini_batch(beta, u_bulk, n_samples):
+    """Vectorized version of u_ini for n_samples particles.
+
+    Same target distribution and proposal window; rejection is applied with a
+    numpy mask, refilling in batches until n_samples are accepted.
+    """
+    if n_samples == 0:
+        return np.empty(0)
+
+    u_min = max(u_bulk - 3.0 / beta, 0.0)
+    u_max = max(u_bulk + 3.0 / beta, 1.0 / beta)
+
+    speed_ratio = u_bulk * beta
+    norm = 2.0 * beta**2 / (
+        math.sqrt(pi) * speed_ratio * (1.0 + erf(speed_ratio))
+        + math.exp(-speed_ratio**2)
+    )
+
+    u_peak = (u_bulk + math.sqrt(u_bulk**2 + 2.0 / beta**2)) / 2.0
+    g_max  = norm * u_peak * math.exp(-beta**2 * (u_peak - u_bulk)**2)
+
+    out = np.empty(n_samples)
+    filled = 0
+    while filled < n_samples:
+        batch = max(int((n_samples - filled) * 2), 16)
+        cand = u_min + np.random.random(batch) * (u_max - u_min)
+        g = norm * cand * np.exp(-beta**2 * (cand - u_bulk)**2)
+        accepted = cand[g >= g_max * np.random.random(batch)]
+        take = min(accepted.size, n_samples - filled)
+        out[filled:filled + take] = accepted[:take]
+        filled += take
+    return out
+
+
 def print_parameters():
     print('Simulation parameters:')
     print(f'  ncell      = {ncell}')
@@ -224,10 +258,13 @@ def get_T(u_arr, v_arr, w_arr, RR_in):
 
 # ===== Simulation Functions =====
 
-def collision(u, v, w, cell, cell_no, cr_max, vol_cell):
-    """DSMC collision step for a single cell (0-based cell_no)."""
-
-    pc = np.where(cell == cell_no)[0]  # get indices of all particles in the cell
+def collision(u, v, w, pc, cr_max, cell_no, vol_cell):
+    """DSMC collision step for a single cell.
+    pc: pre-computed array of particle indices in this cell.
+    All random numbers are batch-generated upfront; pair updates are applied
+    sequentially so each collision sees the velocities from all prior collisions,
+    preserving the correct NTC statistics.
+    """
     nc = len(pc)
     if nc < 2:
         return
@@ -236,12 +273,20 @@ def collision(u, v, w, cell, cell_no, cr_max, vol_cell):
     v_cell = v[pc].copy()
     w_cell = w[pc].copy()
 
-    Nt_colli = int(0.5 * nc * (nc - 1.0) * (sigma_t * cr_max[cell_no]) * dt * Wt / (vol_cell * AVOG)) # number of collisions
-    Nt_colli = max(0, Nt_colli)
+    Nt_colli = int(0.5 * nc * (nc - 1.0) * (sigma_t * cr_max[cell_no]) * dt * Wt / (vol_cell * AVOG))
+    if Nt_colli == 0:
+        return
 
-    for _ in range(Nt_colli):
-        pp1 = int(np.random.random() * nc)
-        pp2 = int(np.random.random() * nc)
+    # Batch-generate all random numbers upfront to avoid per-call Python overhead
+    pp1_arr    = np.random.randint(0, nc, size=Nt_colli)
+    pp2_arr    = np.random.randint(0, nc, size=Nt_colli)
+    r_accept   = np.random.random(size=Nt_colli)
+    r_theta    = np.random.random(size=Nt_colli)
+    r_psi      = np.random.random(size=Nt_colli)
+
+    for i in range(Nt_colli):
+        pp1 = int(pp1_arr[i])
+        pp2 = int(pp2_arr[i])
         if pp1 == pp2:
             continue
 
@@ -251,31 +296,30 @@ def collision(u, v, w, cell, cell_no, cr_max, vol_cell):
         c_rel = math.sqrt(c_rel_x**2 + c_rel_y**2 + c_rel_z**2)
 
         P_accept = c_rel / max(cr_max[cell_no], 1.0e-12)
-        P_accept = min(max(P_accept, 0.0), 1.0)
+        if P_accept > 1.0:
+            P_accept = 1.0
+            cr_max[cell_no] = c_rel
 
-        if np.random.random() <= P_accept:
-            theta = 2.0 * pi * np.random.random()             # azimuthal angle
-            psi = math.acos(1.0 - 2.0 * np.random.random())   # polar angle
+        if r_accept[i] <= P_accept:
+            theta   = 2.0 * pi * r_theta[i]
+            cos_psi = 1.0 - 2.0 * r_psi[i]
+            sin_psi = math.sqrt(max(1.0 - cos_psi**2, 0.0))
 
-            cprime_rel_x = c_rel * math.cos(theta) * math.sin(psi)
-            cprime_rel_y = c_rel * math.sin(theta) * math.sin(psi)
-            cprime_rel_z = c_rel * math.cos(psi)
+            cprime_x = c_rel * math.cos(theta) * sin_psi
+            cprime_y = c_rel * math.sin(theta) * sin_psi
+            cprime_z = c_rel * cos_psi
 
-            u_center = 0.5 * (u_cell[pp1] + u_cell[pp2])
-            v_center = 0.5 * (v_cell[pp1] + v_cell[pp2])
-            w_center = 0.5 * (w_cell[pp1] + w_cell[pp2])
+            u_cm = 0.5 * (u_cell[pp1] + u_cell[pp2])
+            v_cm = 0.5 * (v_cell[pp1] + v_cell[pp2])
+            w_cm = 0.5 * (w_cell[pp1] + w_cell[pp2])
 
-            u_cell[pp1] = u_center + 0.5 * cprime_rel_x
-            v_cell[pp1] = v_center + 0.5 * cprime_rel_y
-            w_cell[pp1] = w_center + 0.5 * cprime_rel_z
-            u_cell[pp2] = u_center - 0.5 * cprime_rel_x
-            v_cell[pp2] = v_center - 0.5 * cprime_rel_y
-            w_cell[pp2] = w_center - 0.5 * cprime_rel_z
+            u_cell[pp1] = u_cm + 0.5 * cprime_x
+            u_cell[pp2] = u_cm - 0.5 * cprime_x
+            v_cell[pp1] = v_cm + 0.5 * cprime_y
+            v_cell[pp2] = v_cm - 0.5 * cprime_y
+            w_cell[pp1] = w_cm + 0.5 * cprime_z
+            w_cell[pp2] = w_cm - 0.5 * cprime_z
 
-            c_rel_x = u_cell[pp1] - u_cell[pp2]
-            c_rel_y = v_cell[pp1] - v_cell[pp2]
-            c_rel_z = w_cell[pp1] - w_cell[pp2]
-            c_rel = math.sqrt(c_rel_x**2 + c_rel_y**2 + c_rel_z**2)
             cr_max[cell_no] = max(c_rel, cr_max[cell_no])
 
     u[pc] = u_cell
@@ -433,72 +477,88 @@ _timers = {'collision': 0.0, 'shock_center': 0.0, 'file_io': 0.0}
 
 # ===== Main Program =====
 
-def _run_step(i, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell, piston_speed,
+def _run_step(i, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell, Uw,
               ua, va, wa, np_cell, np_cell_max, accumulate):
     """Execute one time step: inject, move, collide, optionally accumulate samples.
     Returns (np_count, n_removed_right)."""
     p_in = int(N_in + 0.5)
 
+    # ---- Vectorized injection: batch-sample u_ini/v/w in one call each ----
     inactive_slots = np.where(idx == 0)[0]
     to_inject = min(p_in, len(inactive_slots))
-    for ji in range(to_inject):           # inject particles
-        j = inactive_slots[ji]
-        u[j] = u_ini(beta1, U1)
-        v[j] = gasdev(0.0, std1)
-        w[j] = gasdev(0.0, std1)
-        idx[j] = 1
-        x[j] = 0.0
+    if to_inject > 0:
+        slots = inactive_slots[:to_inject]
+        u[slots] = _sample_u_ini_batch(beta1, U1, to_inject)
+        v[slots] = np.random.normal(0.0, std1, size=to_inject)
+        w[slots] = np.random.normal(0.0, std1, size=to_inject)
+        idx[slots] = 1
+        x[slots] = 0.0
 
     active = (idx == 1)
-    x0 = x.copy()                         # x0 contains old positions
-    x[active] += u[active] * dt           # move particles to new x positions
     np_count = int(np.sum(active))
 
-    right = active & (x >= L_tube)        # indices of particles that collide with right boundary
-    
-    # collide with right boundary, Pullin paper method (uncomment next four lines)
-    #u_old_right = u[right].copy()
-    #u[right] = 2.0 * U2 - u[right]        # update the velocities
-    #t_c = (L_tube - x0[right]) / u_old_right
-    #x[right] = L_tube + u[right] * (dt - t_c)
+    # ---- Detect right-crossers BEFORE moving to avoid a full x0 = x.copy() ----
+    right = active & (x + u * dt >= L_tube)
 
-    # set piston speed
-    Uw = U2*piston_speed
-    
-    # collide with right boundary, Fortran code method (uncomment next two lines)
-    u[right] = 2.0 * Uw - u[right]        # update the velocities
-    x[right] = 2.0 * L_tube - x0[right] + u[right] * dt
+    # ---- Move all active particles ----
+    x[active] += u[active] * dt
 
-    still_right = right & (x >= L_tube)   # remove at right boundary
-    n_removed_right = int(np.sum(still_right))
-    idx[still_right] = 0
-    cell[still_right] = -1
-    np_count -= n_removed_right
+    # ---- Reflect right-crossers off the piston (Fortran-code method) ----
+    if right.any():
+        # Recover old positions from (new x, unchanged u) — small array, only right-crossers
+        x_old_right = x[right] - u[right] * dt
+        u[right] = 2.0 * Uw - u[right]
+        x[right] = 2.0 * L_tube - x_old_right + u[right] * dt
 
-    left = active & ~right & (x < 0.0)    # remove at left boundary
-    idx[left] = 0
-    cell[left] = -1
-    np_count -= int(np.sum(left))
+        still_right = right & (x >= L_tube)
+        n_removed_right = int(np.sum(still_right))
+        if n_removed_right > 0:
+            idx[still_right] = 0
+            cell[still_right] = -1
+            np_count -= n_removed_right
+            active &= ~still_right                # keep `active` in sync w/o recomputing (idx == 1)
+    else:
+        n_removed_right = 0
 
-    still_active = (idx == 1)             # update cell array, where cell[i] = j -> particle i is in cell j 
-    raw_cells = (x[still_active] / L_tube * float(ncell)).astype(int)
-    cell[still_active] = np.clip(raw_cells, 0, ncell - 1)
+    # ---- Left-boundary removal (reflected particles land near L_tube, so ~right is redundant) ----
+    left = active & (x < 0.0)
+    if left.any():
+        n_left = int(np.sum(left))
+        idx[left] = 0
+        cell[left] = -1
+        np_count -= n_left
+        active &= ~left
+
+    # ---- Cell assignment (active now equals still_active) ----
+    raw_cells = (x[active] / L_tube * float(ncell)).astype(int)
+    cell[active] = np.clip(raw_cells, 0, ncell - 1)
+
+    # ---- Build sorted cell index once — O(N log N) vs O(N * ncell) per-cell search ----
+    active_indices = np.where(active)[0]
+    _sort_order  = np.argsort(cell[active_indices], kind='stable')
+    sorted_pix   = active_indices[_sort_order]       # particle indices sorted by cell
+    cells_sorted = cell[sorted_pix]                  # cell id of each sorted particle
+    cell_starts  = np.searchsorted(cells_sorted, np.arange(ncell))
+    cell_ends    = np.searchsorted(cells_sorted, np.arange(ncell), side='right')
 
     _t0 = time.perf_counter()
-    for k in range(ncell):                # do collisions cell by cell
-        collision(u, v, w, cell, k, cr_max, vol_cell)
+    for k in range(ncell):
+        collision(u, v, w, sorted_pix[cell_starts[k]:cell_ends[k]], cr_max, k, vol_cell)
     _timers['collision'] += time.perf_counter() - _t0
 
     if accumulate:                        # true if period is active, i.e. not in warmup or gap
-        acc_idx = np.where(idx == 1)[0]
-        for ji in range(len(acc_idx)):
-            j = acc_idx[ji]
-            c = cell[j]
-            if np_cell[c] < np_cell_max:
-                ua[np_cell[c], c] = u[j]
-                va[np_cell[c], c] = v[j]
-                wa[np_cell[c], c] = w[j]
-                np_cell[c] += 1
+        if len(sorted_pix) > 0:
+            local_pos = np.arange(len(sorted_pix)) - cell_starts[cells_sorted]
+            rows = np_cell[cells_sorted] + local_pos
+            valid_mask = rows < np_cell_max
+            pidx = sorted_pix[valid_mask]
+            rows = rows[valid_mask]
+            cols = cells_sorted[valid_mask]
+            ua[rows, cols] = u[pidx]
+            va[rows, cols] = v[pidx]
+            wa[rows, cols] = w[pidx]
+            counts = cell_ends - cell_starts
+            np_cell += np.minimum(counts, np.maximum(0, np_cell_max - np_cell))
 
     return np_count, n_removed_right
 
@@ -600,7 +660,7 @@ def main():
         print(f'Initialized from state: {args.initialize} ({min(len(state_data), Nmax)} particles)')
     # else: args.initialize == 'empty' -> tube starts empty (arrays already zeroed)
 
-    piston_speed = args.piston_speed
+    Uw = U2 * args.piston_speed          # precomputed once; passed to _run_step
     np_count = 0
     warmup_print_stride = max(10, args.warmup // 100)
     period_print_stride = max(10, args.period // 10) if args.period else 10
@@ -620,7 +680,7 @@ def main():
                 i = 0
                 while True:
                     i += 1
-                    np_count, n_rr = _run_step(i, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell, piston_speed,
+                    np_count, n_rr = _run_step(i, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell, Uw,
                                          ua, va, wa, np_cell, np_cell_max, accumulate=False)
                     _t0 = time.perf_counter()
                     f10.write(f' {i * dt} {float(np_count) / float(N0)}\n')
@@ -635,7 +695,7 @@ def main():
                 # Sampling phase
                 for _ in range(n_sample_steps):
                     i += 1
-                    np_count, n_rr = _run_step(i, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell, piston_speed,
+                    np_count, n_rr = _run_step(i, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell, Uw,
                                          ua, va, wa, np_cell, np_cell_max, accumulate=True)
                     _t0 = time.perf_counter()
                     f10.write(f' {i * dt} {float(np_count) / float(N0)}\n')
@@ -651,7 +711,7 @@ def main():
             else:
                 for i in range(1, Nt_end + 1):
                     accumulate = (Nt_start <= i <= Nt_end)
-                    np_count, n_rr = _run_step(i, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell, piston_speed,
+                    np_count, n_rr = _run_step(i, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell, Uw,
                                          ua, va, wa, np_cell, np_cell_max, accumulate)
                     _t0 = time.perf_counter()
                     f10.write(f' {i * dt} {float(np_count) / float(N0)}\n')
@@ -698,7 +758,7 @@ def main():
                 warmup_end = 0
                 while True:
                     warmup_end += 1
-                    np_count, n_rr = _run_step(warmup_end, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell, piston_speed,
+                    np_count, n_rr = _run_step(warmup_end, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell, Uw,
                                          ua, va, wa, np_cell, np_cell_max, accumulate=False)
                     _t0 = time.perf_counter()
                     f_npt_global.write(f' {warmup_end * dt} {float(np_count) / float(N0)}\n')
@@ -712,7 +772,7 @@ def main():
                 print(f'Warmup complete: {warmup_end} steps (dynamic)')
             else:
                 for warmup_end in range(1, args.warmup + 1):
-                    np_count, n_rr = _run_step(warmup_end, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell, piston_speed,
+                    np_count, n_rr = _run_step(warmup_end, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell, Uw,
                                          ua, va, wa, np_cell, np_cell_max, accumulate=False)
                     _t0 = time.perf_counter()
                     f_npt_global.write(f' {warmup_end * dt} {float(np_count) / float(N0)}\n')
@@ -737,7 +797,7 @@ def main():
                 for local_step in range(1, args.period + 1):
                     global_step = warmup_end + (p - 1) * stride + local_step
                     np_count, n_rr = _run_step(global_step, u, v, w, x, idx, cell, cr_max,
-                                         std1, N_in, vol_cell, piston_speed,
+                                         std1, N_in, vol_cell, Uw,
                                          ua, va, wa, np_cell, np_cell_max, accumulate=True)
                     _t0 = time.perf_counter()
                     f_npt_global.write(f' {global_step * dt} {float(np_count) / float(N0)}\n')
@@ -765,7 +825,7 @@ def main():
                     for gap_step in range(1, gap + 1):
                         global_step = warmup_end + (p - 1) * stride + args.period + gap_step
                         np_count, n_rr = _run_step(global_step, u, v, w, x, idx, cell, cr_max,
-                                             std1, N_in, vol_cell, piston_speed,
+                                             std1, N_in, vol_cell, Uw,
                                              ua, va, wa, np_cell, np_cell_max, accumulate=False)
                         _t0 = time.perf_counter()
                         f_npt_global.write(f' {global_step * dt} {float(np_count) / float(N0)}\n')
