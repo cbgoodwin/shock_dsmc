@@ -22,7 +22,7 @@ pi = math.pi
 s = 2.0          # ratio of bulk flow to most probable speed
 beta1 = 1.0      # inverse of most probable speed
 U1 = s / beta1   # bulk flow velocity in terms of upstream most probable speed
-n = 500          # particles per unit volume
+n = None          # set from -n command-line argument
 
 # Physical parameters
 Ru = 8.314472      # gas constant
@@ -40,10 +40,10 @@ RR = 1.0 / (2.0 * Tp1 * beta1**2)  # specific gas constant
 mm = Ru / RR                       # molar mass
 dm1 = math.sqrt(5.0 * mm * math.sqrt(RR * Tp1 / pi) / (16.0 * mu1))    # hard sphere diameter
 sigma_t = pi * dm1**2                                                  # hard sphere collision cross section
-cm1 = 2.0 / (math.sqrt(pi) * beta1)   # mean molecular speed
-lamda1 = cm1 * rho1 / mu1             # mean free path
-a1 = math.sqrt(gamma * RR * Tp1)      # speed of sound
-Ma1 = U1 / a1                         # Mach speed of gas
+cm1 = 2.0 / (math.sqrt(pi) * beta1)   # upstream mean molecular speed
+lamda1 = cm1 * rho1 / mu1             # upstream mean free path
+a1 = math.sqrt(gamma * RR * Tp1)      # upstream speed of sound
+Ma1 = U1 / a1                         # upstream Mach speed of gas
 
 # Downstream parameters from normal shock relations
 U2 = -2.0 * a1 / (gamma + 1.0) * (Ma1 - 1.0 / Ma1) + U1
@@ -64,10 +64,9 @@ ncell = 185
 dt = 0.5 * lamda2 / cm2
 Nt = 1000
 L_tube = dx * ncell
-N0 = int(n * area * L_tube)
-Nmax = int(3.0 * N0)
 Nreal = ((2.0 * rho1 + rho2) / mm) * AVOG * 20.0 * lamda1 * area
-Wt = Nreal / N0      # scaling factor simulated # to real #?
+# N0, Nmax, Wt are computed in main() once -n is parsed
+N0 = Nmax = Wt = None
 
 
 class _Tee:
@@ -111,6 +110,8 @@ def parse_args():
                         help='Number of time steps per sampling window (positive integer)')
     parser.add_argument('-num_periods', type=int, default=None,
                         help='Number of periods (required with -t)')
+    parser.add_argument('-n', type=int, default=500,
+                        help='Number of simulated particles per unit volume (default: 500)')
     parser.add_argument('-initialize', type=str, default=None,
                         help='"empty" to start with an empty tube, or MMDDYY_hhmmss to '
                              'load particle state from that output folder')
@@ -576,6 +577,12 @@ def _run_step(i, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell, Uw,
 
 def main():
     args = parse_args()
+
+    global n, N0, Nmax, Wt
+    n    = args.n
+    N0   = int(n * area * L_tube)
+    Nmax = int(3.0 * N0)
+    Wt   = Nreal / N0
 
     # Determine sampling window size
     if args.s:
