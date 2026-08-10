@@ -103,50 +103,38 @@ class _Tee:
 
 def parse_args():
     parser = argparse.ArgumentParser(description='DSMC shock simulation')
-    mode = parser.add_mutually_exclusive_group(required=True)
-    mode.add_argument('-s', action='store_true', help='Single batch mode')
-    mode.add_argument('-t', action='store_true', help='Timeseries mode')
-    parser.add_argument('-period', type=int, default=None,
-                        help='Number of time steps per sampling window (positive integer)')
-    parser.add_argument('-num_periods', type=int, default=None,
-                        help='Number of periods (required with -t)')
+    parser.add_argument('-initialize', type=str, default=None,
+                        help='"empty" to start with an empty tube, or path to load particle state from')
+    parser.add_argument('-warmup', type=int, default=None,
+                        help='Number of warmup timesteps before sampling/periods '
+                             '(default: 0 when loading a state, 1000 otherwise)')
+    parser.add_argument('-period', type=int, default=10,
+                        help='Number of time steps per sampling window (default: 10)')
+    parser.add_argument('-num_periods', type=int, default=1,
+                        help='Number of periods (default: 1)')
+    parser.add_argument('-gap', type=int, default=0,
+                        help='Steps between periods (positive integer)')
     parser.add_argument('-n', type=int, default=500,
                         help='Number of simulated particles per unit volume (default: 500)')
-    parser.add_argument('-initialize', type=str, default=None,
-                        help='"empty" to start with an empty tube, or MMDDYY_hhmmss to '
-                             'load particle state from that output folder')
     parser.add_argument('-piston_speed', type=float, default=1.0,
                         help='Piston speed multiplier applied to U2 at the right boundary (default: 1.0, must be > 0)')
     parser.add_argument('-smooth_center', type=int, default=3,
                         help='Number of timesteps in the trailing average used for shock center computation (default: 3, must be > 0)')
-    parser.add_argument('-gap', type=int, default=0,
-                        help='Steps between periods in timeseries mode (positive integer, -t only)')
-    parser.add_argument('-warmup', type=int, default=None,
-                        help='Number of warmup timesteps before sampling/periods '
-                             '(default: 0 when loading a state, 1000 otherwise)')
     args = parser.parse_args()
 
     if args.warmup is None:
         args.warmup = 0 if (args.initialize not in (None, 'empty')) else 1000
 
-    if args.t:
-        if args.period is None or args.num_periods is None:
-            parser.error('-t requires both -period and -num_periods')
-        if args.period <= 0:
-            parser.error('-period must be a positive integer')
-        if args.num_periods <= 0:
-            parser.error('-num_periods must be a positive integer')
-    if args.period is not None and args.period <= 0:
+    if args.period <= 0:
         parser.error('-period must be a positive integer')
+    if args.num_periods <= 0:
+        parser.error('-num_periods must be a positive integer')
     if args.piston_speed <= 0:
         parser.error('-piston_speed must be greater than zero')
     if args.smooth_center <= 0:
         parser.error('-smooth_center must be a positive integer')
-    if args.gap != 0:
-        if args.s:
-            parser.error('-gap can only be used in timeseries mode (-t)')
-        if args.gap <= 0:
-            parser.error('-gap must be a positive integer')
+    if args.gap < 0:
+        parser.error('-gap must be a non-negative integer')
 
     return args
 
@@ -584,16 +572,7 @@ def main():
     Nmax = int(3.0 * N0)
     Wt   = Nreal / N0
 
-    # Determine sampling window size
-    if args.s:
-        if args.period is not None:
-            n_sample_steps = args.period
-        else:
-            n_sample_steps = Nt - int(Nt * 0.8) + 1
-        Nt_start = args.warmup + 1
-        Nt_end   = args.warmup + n_sample_steps
-    else:  # -t mode
-        n_sample_steps = args.period
+    n_sample_steps = args.period
 
     np_cell_max = int(float(Nmax) * float(n_sample_steps) / float(ncell) * 5.0)
 
@@ -683,182 +662,102 @@ def main():
     warmup_print_stride = max(10, args.warmup // 100)
     period_print_stride = max(10, args.period // 10) if args.period else 10
 
-    if args.s:
-        # ----- Single batch mode -----
-        with open(os.path.join(outdir, 'npt.dat'), 'w') as f10, \
-             open(os.path.join(outdir, 'removed_right.dat'), 'w') as f_rr, \
-             open(os.path.join(outdir, 'shock_center.dat'), 'w') as f_sc:
-            f10.write('variables="t","Number of particles in the tube"\n')
-            f_rr.write('variables="t","removed/N_in"\n')
-            f_sc.write('variables="t","center"\n')
+    with open(os.path.join(outdir, 'npt.dat'), 'w') as f_npt_global, \
+         open(os.path.join(outdir, 'removed_right.dat'), 'w') as f_rr, \
+         open(os.path.join(outdir, 'shock_center.dat'), 'w') as f_sc:
+        f_npt_global.write('variables="t","Number of particles in the tube"\n')
+        f_rr.write('variables="t","removed/N_in"\n')
+        f_sc.write('variables="t","center"\n')
 
-            if args.initialize == 'empty':
-                # Dynamic warmup: run until np_count falls below the count from 10 steps prior
-                history = collections.deque(maxlen=10)
-                i = 0
-                while True:
-                    i += 1
-                    np_count, n_rr = _run_step(i, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell, Uw,
-                                         ua, va, wa, np_cell, np_cell_max, accumulate=False)
-                    _t0 = time.perf_counter()
-                    f10.write(f' {i * dt} {float(np_count) / float(N0)}\n')
-                    f_rr.write(f' {i * dt} {float(n_rr) / N_in}\n')
-                    _timers['file_io'] += time.perf_counter() - _t0
-                    if (i - 1) % warmup_print_stride == 0:
-                        print(f'warmup step= {i}  np= {np_count}')
-                    history.append(np_count)
-                    if len(history) == 10 and np_count < history[0]:
-                        break
-                print(f'Warmup complete: {i} steps (dynamic)')
-                # Sampling phase
-                for _ in range(n_sample_steps):
-                    i += 1
-                    np_count, n_rr = _run_step(i, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell, Uw,
-                                         ua, va, wa, np_cell, np_cell_max, accumulate=True)
-                    _t0 = time.perf_counter()
-                    f10.write(f' {i * dt} {float(np_count) / float(N0)}\n')
-                    f_rr.write(f' {i * dt} {float(n_rr) / N_in}\n')
-                    _timers['file_io'] += time.perf_counter() - _t0
-                    _t0 = time.perf_counter()
-                    center = get_shock_center(np.bincount(cell[idx == 1], minlength=ncell).astype(float))
-                    _timers['shock_center'] += time.perf_counter() - _t0
-                    _t0 = time.perf_counter()
-                    f_sc.write(f' {i * dt} {center}\n')
-                    _timers['file_io'] += time.perf_counter() - _t0
-                    print(f'step= {i}  np= {np_count}')
-            else:
-                for i in range(1, Nt_end + 1):
-                    accumulate = (Nt_start <= i <= Nt_end)
-                    np_count, n_rr = _run_step(i, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell, Uw,
-                                         ua, va, wa, np_cell, np_cell_max, accumulate)
-                    _t0 = time.perf_counter()
-                    f10.write(f' {i * dt} {float(np_count) / float(N0)}\n')
-                    f_rr.write(f' {i * dt} {float(n_rr) / N_in}\n')
-                    _timers['file_io'] += time.perf_counter() - _t0
-                    if accumulate:
-                        _t0 = time.perf_counter()
-                        center = get_shock_center(np.bincount(cell[idx == 1], minlength=ncell).astype(float))
-                        _timers['shock_center'] += time.perf_counter() - _t0
-                        _t0 = time.perf_counter()
-                        f_sc.write(f' {i * dt} {center}\n')
-                        _timers['file_io'] += time.perf_counter() - _t0
-                    if accumulate or (i - 1) % warmup_print_stride == 0:
-                        print(f'step= {i}  np= {np_count}')
-                print(f'Warmup complete: {args.warmup} steps')
+        # Warmup phase
+        warmup_end = 0
+        if args.initialize == 'empty':
+            # Dynamic warmup: run until np_count falls below the count from 10 steps prior
+            history = collections.deque(maxlen=10)
+            while True:
+                warmup_end += 1
+                np_count, n_rr = _run_step(warmup_end, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell, Uw,
+                                     ua, va, wa, np_cell, np_cell_max, accumulate=False)
+                _t0 = time.perf_counter()
+                f_npt_global.write(f' {warmup_end * dt} {float(np_count) / float(N0)}\n')
+                f_rr.write(f' {warmup_end * dt} {float(n_rr) / N_in}\n')
+                _timers['file_io'] += time.perf_counter() - _t0
+                if (warmup_end - 1) % warmup_print_stride == 0:
+                    print(f'warmup step= {warmup_end}  np= {np_count}')
+                history.append(np_count)
+                if len(history) == 10 and np_count < history[0]:
+                    break
+            print(f'Warmup complete: {warmup_end} steps (dynamic)')
+        else:
+            for warmup_end in range(1, args.warmup + 1):
+                np_count, n_rr = _run_step(warmup_end, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell, Uw,
+                                     ua, va, wa, np_cell, np_cell_max, accumulate=False)
+                _t0 = time.perf_counter()
+                f_npt_global.write(f' {warmup_end * dt} {float(np_count) / float(N0)}\n')
+                f_rr.write(f' {warmup_end * dt} {float(n_rr) / N_in}\n')
+                _timers['file_io'] += time.perf_counter() - _t0
+                if (warmup_end - 1) % warmup_print_stride == 0:
+                    print(f'warmup step= {warmup_end}  np= {np_count}')
+            print(f'Warmup complete: {args.warmup} steps')
 
-        print(np_cell / float(n_sample_steps))
-        print(f'particle number ratio (Np/N0) {float(np_count) / float(N0)}')
-        print(f'Np for cell statistics= {np_cell}')
-        print(f'Total particle number {N0}')
+        # Timeseries phase: one output set per period, with optional gaps between periods
+        gap = args.gap
+        stride = args.period + gap  # steps consumed per period slot
+        _init_count = np.bincount(cell[idx == 1], minlength=ncell).astype(float)
+        np_cell_buf = collections.deque([_init_count] * args.smooth_center, maxlen=args.smooth_center)
+        for p in range(1, args.num_periods + 1):
+            ua[:] = 0.0
+            va[:] = 0.0
+            wa[:] = 0.0
+            np_cell[:] = 0
 
-        _t0 = time.perf_counter()
-        write_spatial_profiles(ua, va, wa, np_cell, outdir, n_sample_steps)
-        _timers['file_io'] += time.perf_counter() - _t0
-        for i in range(-30, 27, 2):
-            cell_idx = 123 + i  # centred on shock position at 2*L_tube/3
-            if 0 <= cell_idx < ncell:
-                get_pdf_cell(ua, va, wa, np_cell, cell_idx, outdir, n_sample_steps)
+            for local_step in range(1, args.period + 1):
+                global_step = warmup_end + (p - 1) * stride + local_step
+                np_count, n_rr = _run_step(global_step, u, v, w, x, idx, cell, cr_max,
+                                     std1, N_in, vol_cell, Uw,
+                                     ua, va, wa, np_cell, np_cell_max, accumulate=True)
+                _t0 = time.perf_counter()
+                f_npt_global.write(f' {global_step * dt} {float(np_count) / float(N0)}\n')
+                f_rr.write(f' {global_step * dt} {float(n_rr) / N_in}\n')
+                _timers['file_io'] += time.perf_counter() - _t0
+                _t0 = time.perf_counter()
+                np_cell_buf.append(np.bincount(cell[idx == 1], minlength=ncell).astype(float))
+                center = get_shock_center(sum(np_cell_buf) / len(np_cell_buf),
+                                         verbose=(local_step == 1))
+                _timers['shock_center'] += time.perf_counter() - _t0
+                _t0 = time.perf_counter()
+                f_sc.write(f' {global_step * dt} {center}\n')
+                _timers['file_io'] += time.perf_counter() - _t0
+                if (local_step - 1) % period_print_stride == 0:
+                    print(f'period= {p}  step= {local_step}  np= {np_count}')
 
-    else:
-        # ----- Timeseries mode -----
-        with open(os.path.join(outdir, 'npt.dat'), 'w') as f_npt_global, \
-             open(os.path.join(outdir, 'removed_right.dat'), 'w') as f_rr, \
-             open(os.path.join(outdir, 'shock_center.dat'), 'w') as f_sc:
-            f_npt_global.write('variables="t","Number of particles in the tube"\n')
-            f_rr.write('variables="t","removed/N_in"\n')
-            f_sc.write('variables="t","center"\n')
+            _t0 = time.perf_counter()
+            write_spatial_profiles(ua, va, wa, np_cell, outdir, n_sample_steps, period=p)
+            _timers['file_io'] += time.perf_counter() - _t0
+            print(f'period= {p}  particle number ratio (Np/N0) {float(np_count) / float(N0)}')
 
-            # Warmup phase
-            warmup_end = 0
-            if args.initialize == 'empty':
-                # Dynamic warmup: run until np_count falls below the count from 10 steps prior
-                history = collections.deque(maxlen=10)
-                warmup_end = 0
-                while True:
-                    warmup_end += 1
-                    np_count, n_rr = _run_step(warmup_end, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell, Uw,
-                                         ua, va, wa, np_cell, np_cell_max, accumulate=False)
-                    _t0 = time.perf_counter()
-                    f_npt_global.write(f' {warmup_end * dt} {float(np_count) / float(N0)}\n')
-                    f_rr.write(f' {warmup_end * dt} {float(n_rr) / N_in}\n')
-                    _timers['file_io'] += time.perf_counter() - _t0
-                    if (warmup_end - 1) % warmup_print_stride == 0:
-                        print(f'warmup step= {warmup_end}  np= {np_count}')
-                    history.append(np_count)
-                    if len(history) == 10 and np_count < history[0]:
-                        break
-                print(f'Warmup complete: {warmup_end} steps (dynamic)')
-            else:
-                for warmup_end in range(1, args.warmup + 1):
-                    np_count, n_rr = _run_step(warmup_end, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell, Uw,
-                                         ua, va, wa, np_cell, np_cell_max, accumulate=False)
-                    _t0 = time.perf_counter()
-                    f_npt_global.write(f' {warmup_end * dt} {float(np_count) / float(N0)}\n')
-                    f_rr.write(f' {warmup_end * dt} {float(n_rr) / N_in}\n')
-                    _timers['file_io'] += time.perf_counter() - _t0
-                    if (warmup_end - 1) % warmup_print_stride == 0:
-                        print(f'warmup step= {warmup_end}  np= {np_count}')
-                print(f'Warmup complete: {args.warmup} steps')
-
-            # Timeseries phase: one output set per period, with optional gaps between periods
-            gap = args.gap
-            stride = args.period + gap  # steps consumed per period slot
-            # Trailing buffer for 3-step average passed to get_shock_center
-            _init_count = np.bincount(cell[idx == 1], minlength=ncell).astype(float)
-            np_cell_buf = collections.deque([_init_count] * args.smooth_center, maxlen=args.smooth_center)
-            for p in range(1, args.num_periods + 1):
-                ua[:] = 0.0
-                va[:] = 0.0
-                wa[:] = 0.0
-                np_cell[:] = 0
-
-                for local_step in range(1, args.period + 1):
-                    global_step = warmup_end + (p - 1) * stride + local_step
+            # Gap phase: run between periods (skip after the last period)
+            if gap > 0 and p < args.num_periods:
+                gap_print_stride = max(10, gap // 100)
+                for gap_step in range(1, gap + 1):
+                    global_step = warmup_end + (p - 1) * stride + args.period + gap_step
                     np_count, n_rr = _run_step(global_step, u, v, w, x, idx, cell, cr_max,
                                          std1, N_in, vol_cell, Uw,
-                                         ua, va, wa, np_cell, np_cell_max, accumulate=True)
+                                         ua, va, wa, np_cell, np_cell_max, accumulate=False)
                     _t0 = time.perf_counter()
                     f_npt_global.write(f' {global_step * dt} {float(np_count) / float(N0)}\n')
                     f_rr.write(f' {global_step * dt} {float(n_rr) / N_in}\n')
                     _timers['file_io'] += time.perf_counter() - _t0
                     _t0 = time.perf_counter()
-                    np_cell_buf.append(np.bincount(cell[idx == 1], minlength=ncell).astype(float))
-                    center = get_shock_center(sum(np_cell_buf) / len(np_cell_buf),
-                                             verbose=(local_step == 1))
+                    center = get_shock_center(np.bincount(cell[idx == 1], minlength=ncell).astype(float))
                     _timers['shock_center'] += time.perf_counter() - _t0
                     _t0 = time.perf_counter()
                     f_sc.write(f' {global_step * dt} {center}\n')
                     _timers['file_io'] += time.perf_counter() - _t0
-                    if (local_step - 1) % period_print_stride == 0:
-                        print(f'period= {p}  step= {local_step}  np= {np_count}')
+                    if (gap_step - 1) % gap_print_stride == 0:
+                        print(f'period= {p}  gap step= {gap_step}  np= {np_count}')
 
-                _t0 = time.perf_counter()
-                write_spatial_profiles(ua, va, wa, np_cell, outdir, n_sample_steps, period=p)
-                _timers['file_io'] += time.perf_counter() - _t0
-                print(f'period= {p}  particle number ratio (Np/N0) {float(np_count) / float(N0)}')
-
-                # Gap phase: run between periods (skip after the last period)
-                if gap > 0 and p < args.num_periods:
-                    gap_print_stride = max(10, gap // 100)
-                    for gap_step in range(1, gap + 1):
-                        global_step = warmup_end + (p - 1) * stride + args.period + gap_step
-                        np_count, n_rr = _run_step(global_step, u, v, w, x, idx, cell, cr_max,
-                                             std1, N_in, vol_cell, Uw,
-                                             ua, va, wa, np_cell, np_cell_max, accumulate=False)
-                        _t0 = time.perf_counter()
-                        f_npt_global.write(f' {global_step * dt} {float(np_count) / float(N0)}\n')
-                        f_rr.write(f' {global_step * dt} {float(n_rr) / N_in}\n')
-                        _timers['file_io'] += time.perf_counter() - _t0
-                        _t0 = time.perf_counter()
-                        center = get_shock_center(np.bincount(cell[idx == 1], minlength=ncell).astype(float))
-                        _timers['shock_center'] += time.perf_counter() - _t0
-                        _t0 = time.perf_counter()
-                        f_sc.write(f' {global_step * dt} {center}\n')
-                        _timers['file_io'] += time.perf_counter() - _t0
-                        if (gap_step - 1) % gap_print_stride == 0:
-                            print(f'period= {p}  gap step= {gap_step}  np= {np_count}')
-
-        print(f'Total particle number {N0}')
+    print(f'Total particle number {N0}')
 
     _t0 = time.perf_counter()
     active = idx == 1

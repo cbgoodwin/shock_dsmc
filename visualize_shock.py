@@ -54,15 +54,6 @@ def load_dat(path):
     return np.loadtxt(path, skiprows=1)
 
 
-def is_timeseries(outdir):
-    """Return True if the folder was produced in timeseries (-t) mode."""
-    run_info = os.path.join(outdir, 'run_info.txt')
-    if not os.path.isfile(run_info):
-        return False
-    with open(run_info) as f:
-        cmd = f.readline().split()
-    return '-t' in cmd
-
 
 def get_period_files(outdir, prefix):
     """Return sorted list of per-period files matching <prefix>_N.dat."""
@@ -150,22 +141,21 @@ def plot_npt(outdir):
         lines = [line1, line2]
         ax.legend(lines, [l.get_label() for l in lines], fontsize=8)
 
-    # In timeseries mode, draw separators at period boundaries
-    if is_timeseries(outdir):
-        num_periods = get_run_param(outdir, 'num_periods', 0)
-        period_steps = get_run_param(outdir, 'period', 0)
-        if num_periods > 0 and period_steps > 0:
-            gap = get_gap(outdir)
-            stride = period_steps + gap
-            warmup_steps = len(t) - num_periods * period_steps - (num_periods - 1) * gap
-            for p in range(num_periods):
-                start_idx = warmup_steps + p * stride
-                if 0 <= start_idx < len(t):
-                    ax.axvline(t[start_idx], color='gray', linewidth=0.7, linestyle='--', alpha=0.7)
-                if gap > 0 and p < num_periods - 1:
-                    end_idx = warmup_steps + p * stride + period_steps
-                    if 0 <= end_idx < len(t):
-                        ax.axvline(t[end_idx], color='gray', linewidth=0.7, linestyle='--', alpha=0.7)
+    # Draw separators at period boundaries
+    num_periods = get_run_param(outdir, 'num_periods', 0)
+    period_steps = get_run_param(outdir, 'period', 0)
+    if num_periods > 0 and period_steps > 0:
+        gap = get_gap(outdir)
+        stride = period_steps + gap
+        warmup_steps = len(t) - num_periods * period_steps - (num_periods - 1) * gap
+        for p in range(num_periods):
+            start_idx = warmup_steps + p * stride
+            if 0 <= start_idx < len(t):
+                ax.axvline(t[start_idx], color='gray', linewidth=0.7, linestyle='--', alpha=0.7)
+            if gap > 0 and p < num_periods - 1:
+                end_idx = warmup_steps + p * stride + period_steps
+                if 0 <= end_idx < len(t):
+                    ax.axvline(t[end_idx], color='gray', linewidth=0.7, linestyle='--', alpha=0.7)
 
     ax.set_xlabel('Time')
     ax.set_ylabel(r'$N_p \/ / \/ N_0$', color='tab:blue')
@@ -206,66 +196,32 @@ def _plot_spatial_timeseries(outdir, prefix, ylabel, title_label):
 
 
 def plot_rho(outdir):
-    if is_timeseries(outdir):
-        _plot_spatial_timeseries(outdir, 'rho', r'$\rho \/ / \/ \rho_0$', 'Density profile')
-        return
-    path = os.path.join(outdir, 'rho.dat')
-    data = load_dat(path)
-    x, rho = data[:, 0], data[:, 1]
-
-    _, ax = plt.subplots(figsize=(7, 4))
-    ax.plot(x, rho, linewidth=1.2)
-    ax.set_xlabel(r'$x \/ / \/ \lambda_1$')
-    ax.set_ylabel(r'$\rho \/ / \/ \rho_0$')
-    ax.set_title(f'Density profile\n{Path(outdir).name}')
-    ax.grid(True, alpha=0.3)
-    plt.tight_layout()
+    _plot_spatial_timeseries(outdir, 'rho', r'$\rho \/ / \/ \rho_0$', 'Density profile')
 
 
 def plot_u(outdir):
-    if is_timeseries(outdir):
-        _plot_spatial_timeseries(outdir, 'u', r'$\langle u \rangle$', 'Mean x-velocity profile')
-        return
-    path = os.path.join(outdir, 'u.dat')
-    data = load_dat(path)
-    x, u = data[:, 0], data[:, 1]
-
-    _, ax = plt.subplots(figsize=(7, 4))
-    ax.plot(x, u, linewidth=1.2)
-    ax.set_xlabel(r'$x \/ / \/ \lambda_1$')
-    ax.set_ylabel(r'$\langle u \rangle$')
-    ax.set_title(f'Mean x-velocity profile\n{Path(outdir).name}')
-    ax.grid(True, alpha=0.3)
-    plt.tight_layout()
+    _plot_spatial_timeseries(outdir, 'u', r'$\langle u \rangle$', 'Mean x-velocity profile')
 
 
 def plot_flux(outdir):
-    if is_timeseries(outdir):
-        rho_path = os.path.join(outdir, 'rho.dat')
-        if not os.path.isfile(rho_path):
-            print(f'No rho.dat found in {Path(outdir).name}')
-            return
-        rho_data = load_dat(rho_path)
-        u_data   = load_dat(os.path.join(outdir, 'u.dat'))
-        periods = np.unique(rho_data[:, 0].astype(int))
-        n = len(periods)
-        colors = cm.viridis(np.linspace(0, 1, n))
-        _, ax = plt.subplots(figsize=(8, 5))
-        for period, color in zip(periods, colors):
-            rows = np.where(rho_data[:, 0].astype(int) == period)[0]
-            rows = rows[len(rows) // 10:]
-            ax.plot(rho_data[rows, 1], rho_data[rows, 2] * u_data[rows, 2], color=color, linewidth=1.0)
-        sm = plt.cm.ScalarMappable(cmap='viridis', norm=plt.Normalize(1, n))
-        sm.set_array([])
-        plt.colorbar(sm, ax=ax, label='period')
-        ax.set_title(f'Mass flux profile — timeseries ({n} periods)\n{Path(outdir).name}')
-    else:
-        rho_data = load_dat(os.path.join(outdir, 'rho.dat'))
-        u_data   = load_dat(os.path.join(outdir, 'u.dat'))
-        _, ax = plt.subplots(figsize=(7, 4))
-        skip = len(rho_data) // 10
-        ax.plot(rho_data[skip:, 0], rho_data[skip:, 1] * u_data[skip:, 1], linewidth=1.2)
-        ax.set_title(f'Mass flux profile\n{Path(outdir).name}')
+    rho_path = os.path.join(outdir, 'rho.dat')
+    if not os.path.isfile(rho_path):
+        print(f'No rho.dat found in {Path(outdir).name}')
+        return
+    rho_data = load_dat(rho_path)
+    u_data   = load_dat(os.path.join(outdir, 'u.dat'))
+    periods = np.unique(rho_data[:, 0].astype(int))
+    n = len(periods)
+    colors = cm.viridis(np.linspace(0, 1, n))
+    _, ax = plt.subplots(figsize=(8, 5))
+    for period, color in zip(periods, colors):
+        rows = np.where(rho_data[:, 0].astype(int) == period)[0]
+        rows = rows[len(rows) // 10:]
+        ax.plot(rho_data[rows, 1], rho_data[rows, 2] * u_data[rows, 2], color=color, linewidth=1.0)
+    sm = plt.cm.ScalarMappable(cmap='viridis', norm=plt.Normalize(1, n))
+    sm.set_array([])
+    plt.colorbar(sm, ax=ax, label='period')
+    ax.set_title(f'Mass flux profile — timeseries ({n} periods)\n{Path(outdir).name}')
     ax.set_xlabel(r'$x \/ / \/ \lambda_1$')
     ax.set_ylabel(r'$\rho u$')
     ax.grid(True, alpha=0.3)
@@ -273,20 +229,7 @@ def plot_flux(outdir):
 
 
 def plot_T(outdir):
-    if is_timeseries(outdir):
-        _plot_spatial_timeseries(outdir, 'T', 'T', 'Temperature profile')
-        return
-    path = os.path.join(outdir, 'T.dat')
-    data = load_dat(path)
-    x, T = data[:, 0], data[:, 1]
-
-    _, ax = plt.subplots(figsize=(7, 4))
-    ax.plot(x, T, linewidth=1.2)
-    ax.set_xlabel(r'$x \/ / \/ \lambda_1$')
-    ax.set_ylabel('T')
-    ax.set_title(f'Temperature profile\n{Path(outdir).name}')
-    ax.grid(True, alpha=0.3)
-    plt.tight_layout()
+    _plot_spatial_timeseries(outdir, 'T', 'T', 'Temperature profile')
 
 
 def plot_shock_center(outdir):
@@ -410,9 +353,8 @@ def main():
     folder_arg = sys.argv[2] if len(sys.argv) >= 3 else None
     outdir = find_output_dir(folder_arg)
     print(f'Reading from: {Path(outdir).name}')
-    if is_timeseries(outdir):
-        n = get_run_param(outdir, 'num_periods', 0)
-        print(f'Timeseries mode detected: {n} period(s)')
+    n = get_run_param(outdir, 'num_periods', 0)
+    print(f'{n} period(s)')
 
     # Derive plots folder from the datetime embedded in the output folder name
     datetime_suffix = Path(outdir).name[len('shock_output_'):]
