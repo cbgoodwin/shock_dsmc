@@ -120,6 +120,8 @@ def parse_args():
                         help='Piston speed multiplier applied to U2 at the right boundary (default: 1.0, must be > 0)')
     parser.add_argument('-smooth_center', type=int, default=3,
                         help='Number of timesteps in the trailing average used for shock center computation (default: 3, must be > 0)')
+    parser.add_argument('-seed', type=int, default=None,
+                        help='Random seed for reproducibility (default: None, i.e. random)')
     args = parser.parse_args()
 
     if args.warmup is None:
@@ -571,6 +573,8 @@ def main():
     N0   = int(n * area * L_tube)
     Nmax = int(3.0 * N0)
     Wt   = Nreal / N0
+
+    np.random.seed(args.seed)
 
     n_sample_steps = args.period
 
