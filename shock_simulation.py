@@ -122,6 +122,14 @@ def parse_args():
                         help='Number of timesteps in the trailing average used for shock center computation (default: 3, must be > 0)')
     parser.add_argument('-seed', type=int, default=None,
                         help='Random seed for reproducibility (default: None, i.e. random)')
+    parser.add_argument('-adaptive', type=float, nargs='?', const=0.01, default=None,
+                        help='Adaptively adjust piston speed each step based on midpoint density; '
+                             'value sets the gain multiplier (default when flag is used: 0.01)')
+    parser.add_argument('-model', type=str, default='hs', choices=['hs', 'maxwell'],
+                        help='Collision model: hs = hard sphere (default), maxwell = Maxwell molecules')
+    parser.add_argument('-adaptive_mode', type=str, default='density', choices=['density', 'particles'],
+                        help='Adaptive piston mode: density (default) uses midpoint density; '
+                             'particles uses total particle count relative to target')
     args = parser.parse_args()
 
     if args.warmup is None:
@@ -249,12 +257,16 @@ def get_T(u_arr, v_arr, w_arr, RR_in):
 
 # ===== Simulation Functions =====
 
-def collision(u, v, w, pc, cr_max, cell_no, vol_cell):
+def collision(u, v, w, pc, cr_max, cell_no, vol_cell, maxwell=False):
     """DSMC collision step for a single cell.
     pc: pre-computed array of particle indices in this cell.
     All random numbers are batch-generated upfront; pair updates are applied
     sequentially so each collision sees the velocities from all prior collisions,
     preserving the correct NTC statistics.
+
+    maxwell=True: Maxwell molecule model. sigma*c_rel is constant, so all
+    candidate pairs are accepted (P_accept=1) and cr_max is not updated.
+    maxwell=False (default): hard sphere model with NTC acceptance.
     """
     nc = len(pc)
     if nc < 2:
@@ -269,11 +281,12 @@ def collision(u, v, w, pc, cr_max, cell_no, vol_cell):
         return
 
     # Batch-generate all random numbers upfront to avoid per-call Python overhead
-    pp1_arr    = np.random.randint(0, nc, size=Nt_colli)
-    pp2_arr    = np.random.randint(0, nc, size=Nt_colli)
-    r_accept   = np.random.random(size=Nt_colli)
-    r_theta    = np.random.random(size=Nt_colli)
-    r_psi      = np.random.random(size=Nt_colli)
+    pp1_arr  = np.random.randint(0, nc, size=Nt_colli)
+    pp2_arr  = np.random.randint(0, nc, size=Nt_colli)
+    r_theta  = np.random.random(size=Nt_colli)
+    r_psi    = np.random.random(size=Nt_colli)
+    if not maxwell:
+        r_accept = np.random.random(size=Nt_colli)
 
     for i in range(Nt_colli):
         pp1 = int(pp1_arr[i])
@@ -286,12 +299,16 @@ def collision(u, v, w, pc, cr_max, cell_no, vol_cell):
         c_rel_z = w_cell[pp1] - w_cell[pp2]
         c_rel = math.sqrt(c_rel_x**2 + c_rel_y**2 + c_rel_z**2)
 
-        P_accept = c_rel / max(cr_max[cell_no], 1.0e-12)
-        if P_accept > 1.0:
-            P_accept = 1.0
-            cr_max[cell_no] = c_rel
+        if maxwell:
+            do_collision = True
+        else:
+            P_accept = c_rel / max(cr_max[cell_no], 1.0e-12)
+            if P_accept > 1.0:
+                P_accept = 1.0
+                cr_max[cell_no] = c_rel
+            do_collision = r_accept[i] <= P_accept
 
-        if r_accept[i] <= P_accept:
+        if do_collision:
             theta   = 2.0 * pi * r_theta[i]
             cos_psi = 1.0 - 2.0 * r_psi[i]
             sin_psi = math.sqrt(max(1.0 - cos_psi**2, 0.0))
@@ -311,7 +328,8 @@ def collision(u, v, w, pc, cr_max, cell_no, vol_cell):
             w_cell[pp1] = w_cm + 0.5 * cprime_z
             w_cell[pp2] = w_cm - 0.5 * cprime_z
 
-            cr_max[cell_no] = max(c_rel, cr_max[cell_no])
+            if not maxwell:
+                cr_max[cell_no] = max(c_rel, cr_max[cell_no])
 
     u[pc] = u_cell
     v[pc] = v_cell
@@ -469,7 +487,7 @@ _timers = {'collision': 0.0, 'shock_center': 0.0, 'file_io': 0.0}
 # ===== Main Program =====
 
 def _run_step(i, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell, Uw,
-              ua, va, wa, np_cell, np_cell_max, accumulate):
+              ua, va, wa, np_cell, np_cell_max, accumulate, maxwell=False):
     """Execute one time step: inject, move, collide, optionally accumulate samples.
     Returns (np_count, n_removed_right)."""
     p_in = int(N_in + 0.5)
@@ -543,9 +561,15 @@ def _run_step(i, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell, Uw,
     cell_starts  = np.searchsorted(cells_sorted, np.arange(ncell))
     cell_ends    = np.searchsorted(cells_sorted, np.arange(ncell), side='right')
 
+    # Midpoint cell density (for adaptive piston control).
+    # ncell//2 is the cell closer to the right boundary when ncell is even.
+    target_shock_center = (ncell*2) // 3
+    rho0_norm = float(N0) / (float(ncell) * (2.0/3.0 * rho1 + 1.0/3.0 * rho2))
+    rho_halfway = (cell_ends[target_shock_center] - cell_starts[target_shock_center]) / rho0_norm
+
     _t0 = time.perf_counter()
     for k in range(ncell):
-        collision(u, v, w, sorted_pix[cell_starts[k]:cell_ends[k]], cr_max, k, vol_cell)
+        collision(u, v, w, sorted_pix[cell_starts[k]:cell_ends[k]], cr_max, k, vol_cell, maxwell)
     _timers['collision'] += time.perf_counter() - _t0
 
     if accumulate:                        # true if period is active, i.e. not in warmup or gap
@@ -562,7 +586,7 @@ def _run_step(i, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell, Uw,
             counts = cell_ends - cell_starts
             np_cell += np.minimum(counts, np.maximum(0, np_cell_max - np_cell))
 
-    return np_count, n_removed_right
+    return np_count, n_removed_right, rho_halfway
 
 
 def main():
@@ -661,17 +685,26 @@ def main():
         print(f'Initialized from state: {args.initialize} ({min(len(state_data), Nmax)} particles)')
     # else: args.initialize == 'empty' -> tube starts empty (arrays already zeroed)
 
+    # Target particle count for adaptive_mode=particles
+    if args.initialize not in (None, 'empty'):
+        np_count_target = min(len(state_data), Nmax)
+    else:
+        np_count_target = N0
+
     Uw = U2 * args.piston_speed          # precomputed once; passed to _run_step
+    maxwell = (args.model == 'maxwell')
     np_count = 0
     warmup_print_stride = max(10, args.warmup // 100)
     period_print_stride = max(10, args.period // 10) if args.period else 10
 
     with open(os.path.join(outdir, 'npt.dat'), 'w') as f_npt_global, \
          open(os.path.join(outdir, 'removed_right.dat'), 'w') as f_rr, \
-         open(os.path.join(outdir, 'shock_center.dat'), 'w') as f_sc:
+         open(os.path.join(outdir, 'shock_center.dat'), 'w') as f_sc, \
+         open(os.path.join(outdir, 'piston_speed.dat'), 'w') as f_ps:
         f_npt_global.write('variables="t","Number of particles in the tube"\n')
         f_rr.write('variables="t","removed/N_in"\n')
         f_sc.write('variables="t","center"\n')
+        f_ps.write('variables="t","Uw"\n')
 
         # Warmup phase
         warmup_end = 0
@@ -680,11 +713,17 @@ def main():
             history = collections.deque(maxlen=10)
             while True:
                 warmup_end += 1
-                np_count, n_rr = _run_step(warmup_end, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell, Uw,
-                                     ua, va, wa, np_cell, np_cell_max, accumulate=False)
+                np_count, n_rr, rho_halfway = _run_step(warmup_end, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell, Uw,
+                                     ua, va, wa, np_cell, np_cell_max, accumulate=False, maxwell=maxwell)
+                if args.adaptive is not None:
+                    if args.adaptive_mode == 'particles':
+                        Uw = U2 + U2 * 100 * ((np_count - np_count_target) / np_count_target) * args.adaptive
+                    else:
+                        Uw = U2 + U2 * (rho_halfway - (rho1 + rho2) / 2.0) * args.adaptive
                 _t0 = time.perf_counter()
                 f_npt_global.write(f' {warmup_end * dt} {float(np_count) / float(N0)}\n')
                 f_rr.write(f' {warmup_end * dt} {float(n_rr) / N_in}\n')
+                f_ps.write(f' {warmup_end * dt} {Uw}\n')
                 _timers['file_io'] += time.perf_counter() - _t0
                 if (warmup_end - 1) % warmup_print_stride == 0:
                     print(f'warmup step= {warmup_end}  np= {np_count}')
@@ -694,11 +733,17 @@ def main():
             print(f'Warmup complete: {warmup_end} steps (dynamic)')
         else:
             for warmup_end in range(1, args.warmup + 1):
-                np_count, n_rr = _run_step(warmup_end, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell, Uw,
-                                     ua, va, wa, np_cell, np_cell_max, accumulate=False)
+                np_count, n_rr, rho_halfway = _run_step(warmup_end, u, v, w, x, idx, cell, cr_max, std1, N_in, vol_cell, Uw,
+                                     ua, va, wa, np_cell, np_cell_max, accumulate=False, maxwell=maxwell)
+                if args.adaptive is not None:
+                    if args.adaptive_mode == 'particles':
+                        Uw = U2 + U2 * 100 * ((np_count - np_count_target) / np_count_target) * args.adaptive
+                    else:
+                        Uw = U2 + U2 * (rho_halfway - (rho1 + rho2) / 2.0) * args.adaptive
                 _t0 = time.perf_counter()
                 f_npt_global.write(f' {warmup_end * dt} {float(np_count) / float(N0)}\n')
                 f_rr.write(f' {warmup_end * dt} {float(n_rr) / N_in}\n')
+                f_ps.write(f' {warmup_end * dt} {Uw}\n')
                 _timers['file_io'] += time.perf_counter() - _t0
                 if (warmup_end - 1) % warmup_print_stride == 0:
                     print(f'warmup step= {warmup_end}  np= {np_count}')
@@ -717,12 +762,18 @@ def main():
 
             for local_step in range(1, args.period + 1):
                 global_step = warmup_end + (p - 1) * stride + local_step
-                np_count, n_rr = _run_step(global_step, u, v, w, x, idx, cell, cr_max,
+                np_count, n_rr, rho_halfway = _run_step(global_step, u, v, w, x, idx, cell, cr_max,
                                      std1, N_in, vol_cell, Uw,
-                                     ua, va, wa, np_cell, np_cell_max, accumulate=True)
+                                     ua, va, wa, np_cell, np_cell_max, accumulate=True, maxwell=maxwell)
+                if args.adaptive is not None:
+                    if args.adaptive_mode == 'particles':
+                        Uw = U2 + U2 * 100 * ((np_count - np_count_target) / np_count_target) * args.adaptive
+                    else:
+                        Uw = U2 + U2 * (rho_halfway - (rho1 + rho2) / 2.0) * args.adaptive
                 _t0 = time.perf_counter()
                 f_npt_global.write(f' {global_step * dt} {float(np_count) / float(N0)}\n')
                 f_rr.write(f' {global_step * dt} {float(n_rr) / N_in}\n')
+                f_ps.write(f' {global_step * dt} {Uw}\n')
                 _timers['file_io'] += time.perf_counter() - _t0
                 _t0 = time.perf_counter()
                 np_cell_buf.append(np.bincount(cell[idx == 1], minlength=ncell).astype(float))
@@ -745,12 +796,18 @@ def main():
                 gap_print_stride = max(10, gap // 100)
                 for gap_step in range(1, gap + 1):
                     global_step = warmup_end + (p - 1) * stride + args.period + gap_step
-                    np_count, n_rr = _run_step(global_step, u, v, w, x, idx, cell, cr_max,
+                    np_count, n_rr, rho_halfway = _run_step(global_step, u, v, w, x, idx, cell, cr_max,
                                          std1, N_in, vol_cell, Uw,
-                                         ua, va, wa, np_cell, np_cell_max, accumulate=False)
+                                         ua, va, wa, np_cell, np_cell_max, accumulate=False, maxwell=maxwell)
+                    if args.adaptive is not None:
+                        if args.adaptive_mode == 'particles':
+                            Uw = U2 + U2 * 100 * ((np_count - np_count_target) / np_count_target) * args.adaptive
+                        else:
+                            Uw = U2 + U2 * (rho_halfway - (rho1 + rho2) / 2.0) * args.adaptive
                     _t0 = time.perf_counter()
                     f_npt_global.write(f' {global_step * dt} {float(np_count) / float(N0)}\n')
                     f_rr.write(f' {global_step * dt} {float(n_rr) / N_in}\n')
+                    f_ps.write(f' {global_step * dt} {Uw}\n')
                     _timers['file_io'] += time.perf_counter() - _t0
                     _t0 = time.perf_counter()
                     center = get_shock_center(np.bincount(cell[idx == 1], minlength=ncell).astype(float))

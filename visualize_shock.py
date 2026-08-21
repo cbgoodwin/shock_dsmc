@@ -15,6 +15,7 @@ rho/u/T plots overlay all periods with a viridis colormap (early=dark, late=brig
 import sys
 import os
 import glob
+import math
 from pathlib import Path
 import numpy as np
 import matplotlib.pyplot as plt
@@ -327,21 +328,95 @@ def plot_pdf(outdir):
     plt.tight_layout()
 
 
+def plot_piston_pdf(outdir):
+    path = os.path.join(outdir, 'piston_speed.dat')
+    if not os.path.isfile(path):
+        print(f'No piston_speed.dat found in {Path(outdir).name}')
+        return
+    data = load_dat(path)
+    if data.ndim == 1:
+        data = data.reshape(1, -1)
+    Uw = data[:, 1]
+
+    # One bin per unique value, with bin edges at midpoints between neighbours.
+    unique_vals = np.unique(Uw)
+    if len(unique_vals) == 1:
+        half = 0.5
+        bins = [unique_vals[0] - half, unique_vals[0] + half]
+    else:
+        gaps = np.diff(unique_vals)
+        edges_inner = unique_vals[:-1] + gaps / 2.0
+        bins = np.concatenate([
+            [unique_vals[0] - gaps[0] / 2.0],
+            edges_inner,
+            [unique_vals[-1] + gaps[-1] / 2.0],
+        ])
+    _, ax = plt.subplots(figsize=(7, 4))
+    ax.hist(Uw, bins=bins, density=True, color='tab:blue', alpha=0.7)
+    ax.set_xlabel(r'$U_w$')
+    ax.set_ylabel('Density')
+    ax.set_title(f'Piston speed distribution\n{Path(outdir).name}')
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+
+
+def plot_piston_speed(outdir):
+    path = os.path.join(outdir, 'piston_speed.dat')
+    if not os.path.isfile(path):
+        print(f'No piston_speed.dat found in {Path(outdir).name}')
+        return
+    data = load_dat(path)
+    if data.ndim == 1:
+        data = data.reshape(1, -1)
+    t, Uw = data[:, 0], data[:, 1]
+
+    # Expanding-window cumulative mean and sample std
+    counts   = np.arange(1, len(Uw) + 1, dtype=float)
+    cumsum   = np.cumsum(Uw)
+    cumsum_sq = np.cumsum(Uw ** 2)
+    cum_mean = cumsum / counts
+    # Sample variance with ddof=1; guard against floating-point negatives
+    cum_var  = (cumsum_sq - cumsum ** 2 / counts) / np.maximum(counts - 1, 1)
+    cum_std  = np.sqrt(np.maximum(cum_var, 0.0))
+
+    stat_mask = counts >= 100      # only show statistics after 100 steps
+
+    _, ax = plt.subplots(figsize=(8, 4))
+    ax.scatter(t, Uw, color='tab:blue', s=1, alpha=0.5, label=r'$U_w$', linewidths=0)
+    if stat_mask.any():
+        t_s = t[stat_mask]
+        m_s = cum_mean[stat_mask]
+        s_s = cum_std[stat_mask]
+        ax.plot(t_s, m_s, color='tab:orange', linewidth=1.2, label='cumulative mean')
+        ax.fill_between(t_s, m_s - s_s, m_s + s_s,
+                        color='tab:orange', alpha=0.25, label='±1 std')
+    ax.set_xlabel('Time')
+    ax.set_ylabel(r'$U_w$')
+    ax.set_title(f'Piston speed over time\n{Path(outdir).name}')
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
 PLOT_FUNCS = {
-    'npt':          plot_npt,
-    'rho':          plot_rho,
-    'u':            plot_u,
-    'T':            plot_T,
-    'flux':         plot_flux,
-    'pdf':          plot_pdf,
-    'shock_center': plot_shock_center,
+    'npt':           plot_npt,
+    'rho':           plot_rho,
+    'u':             plot_u,
+    'T':             plot_T,
+    'flux':          plot_flux,
+    'pdf':           plot_pdf,
+    'shock_center':  plot_shock_center,
+    'piston_speed':  plot_piston_speed,
+    'piston_pdf':    plot_piston_pdf,
 }
 
-VALID_TYPES = list(PLOT_FUNCS.keys()) + ['all']
+MAIN_PLOTS = ['npt', 'rho', 'shock_center', 'piston_speed']
+
+VALID_TYPES = list(PLOT_FUNCS.keys()) + ['all', 'main']
 
 
 def main():
@@ -362,7 +437,12 @@ def main():
     plots_dir = PLOTS_ROOT / f'plots_{datetime_suffix}'
     plots_dir.mkdir(exist_ok=True)
 
-    to_plot = list(PLOT_FUNCS.keys()) if plot_type == 'all' else [plot_type]
+    if plot_type == 'all':
+        to_plot = list(PLOT_FUNCS.keys())
+    elif plot_type == 'main':
+        to_plot = MAIN_PLOTS
+    else:
+        to_plot = [plot_type]
     any_new = False
     for pt in to_plot:
         plot_path = plots_dir / f'{pt}.pdf'
